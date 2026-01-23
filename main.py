@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -18,7 +18,6 @@ from pdf_parser_dfp import parse_dfp_pdf
 from utils import (
     calculate_cagr,
     ensure_dir,
-    normalize_cnpj,
     parse_bool,
     parse_decimal,
     setup_logging,
@@ -33,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CVM DFP Bot")
-    parser.add_argument("--input", required=True, help="CSV com ticker e cnpj")
+    parser.add_argument("--input", required=True, help="CSV com ticker e cod_cvm")
     parser.add_argument("--start-date", required=True, help="Data inicial dd/mm/yyyy")
     parser.add_argument("--end-date", required=True, help="Data final dd/mm/yyyy")
     parser.add_argument("--headless", default="true", help="true/false")
@@ -44,7 +43,7 @@ def parse_args() -> argparse.Namespace:
 
 def load_input(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    required = {"ticker", "cnpj", "asset_class"}
+    required = {"ticker", "cod_cvm", "asset_class"}
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"CSV faltando colunas obrigatórias: {missing}")
@@ -78,6 +77,13 @@ def collect_pdfs(extracted_paths: List[str], pdf_dir: str) -> List[str]:
     return pdfs
 
 
+def write_result(output_root: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    result_path = os.path.join(output_root, "result.json")
+    with open(result_path, "w", encoding="utf-8") as file_handle:
+        json.dump(result, file_handle, ensure_ascii=False, indent=2)
+    return result
+
+
 def has_sufficient_series(series: Dict[int, float], years: int = 5) -> bool:
     if not series or len(series) < 2:
         return False
@@ -95,7 +101,8 @@ def process_row(
 ) -> Dict[str, Any]:
     ticker = str(row["ticker"]).upper().strip()
     asset_class = str(row["asset_class"]).strip()
-    cnpj = normalize_cnpj(str(row["cnpj"]))
+    cod_cvm_raw = row.get("cod_cvm")
+    cod_cvm = "" if pd.isna(cod_cvm_raw) else str(cod_cvm_raw).strip()
 
     output_root = os.path.join("/output", ticker)
     downloads_dir = os.path.join(output_root, "downloads")
@@ -107,9 +114,8 @@ def process_row(
 
     result: Dict[str, Any] = {
         "ticker": ticker,
-        "cnpj": cnpj,
-        "codigo_cvm": None,
-        "source": "CVM_SWB_RAD_ENET_DFP",
+        "codigo_cvm": cod_cvm or None,
+        "source": "CVM_RAD_ENET_DFP",
         "period": {"start_date": start_date, "end_date": end_date},
         "currency_unit": None,
         "historical": {"receita_liquida": {}, "lucro_liquido": {}},
@@ -123,7 +129,7 @@ def process_row(
         "missing_inputs": [],
         "errors": [],
         "status": "pending",
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
     current_price = parse_decimal(row.get("current_price"))
@@ -158,21 +164,25 @@ def process_row(
     data_ultimo_dividendo = None
     has_parsing_errors = False
 
+    if not cod_cvm:
+        message = "Código CVM ausente no CSV"
+        logger.warning("%s | ticker=%s", message, ticker)
+        result["errors"].append(message)
+        result["status"] = "failed"
+        return write_result(output_root, result)
+
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=headless)
             context = browser.new_context(accept_downloads=True)
             page = context.new_page()
             flow = CvmFlow(page, timeout_ms=timeout_ms)
-            _, codigo_cvm = flow.find_company_by_cnpj(cnpj)
-            if not codigo_cvm:
-                raise ValueError("Código CVM não encontrado")
-            result["codigo_cvm"] = codigo_cvm
-            flow.open_enet(codigo_cvm)
+            logger.info("Processando %s | código CVM %s", ticker, cod_cvm)
+            flow.open_enet(cod_cvm)
             flow.apply_filters(start_date, end_date)
 
             zip_paths = download_documents(
-                page, ticker, codigo_cvm, downloads_dir, retries=max_retries
+                page, ticker, cod_cvm, downloads_dir, retries=max_retries
             )
             if not zip_paths:
                 result["errors"].append("Nenhum ZIP encontrado")
@@ -279,11 +289,7 @@ def process_row(
         result["errors"].append(str(exc))
         result["status"] = "failed"
 
-    result_path = os.path.join(output_root, "result.json")
-    with open(result_path, "w", encoding="utf-8") as file_handle:
-        json.dump(result, file_handle, ensure_ascii=False, indent=2)
-
-    return result
+    return write_result(output_root, result)
 
 
 def main() -> None:
