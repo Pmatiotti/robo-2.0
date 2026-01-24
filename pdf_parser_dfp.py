@@ -1,36 +1,53 @@
 import logging
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pdfplumber
 
 logger = logging.getLogger(__name__)
 
-VALUE_RE = re.compile(r"(-?\(?[\d\.]+,\d+\)?)")
+VALUE_RE = re.compile(r"(\(?-?\d{1,3}(?:\.\d{3})*,\d+\)?)")
 MILLI_RE = re.compile(r"(reais\s*mil|em\s*milhares)", re.IGNORECASE)
-YEAR_RE = re.compile(r"\b(20\d{2})\b")
+DATE_RE = re.compile(r"31/12/(20\d{2})")
 DIVIDEND_VALUE_RE = re.compile(r"(dividendos?|jcp|juros\s+sobre\s+capital).*?([\\d\\.]+,\\d+)", re.IGNORECASE)
 DIVIDEND_DATE_RE = re.compile(r"(\\d{2}/\\d{2}/\\d{4})")
 
-FIELD_PATTERNS = {
-    "ativo_total": [r"Ativo\s+Total"],
-    "passivo_total": [r"Passivo\s+Total"],
-    "patrimonio_liquido": [r"Patrim[oô]nio\s+L[ií]quido"],
-    "ativo_circulante": [r"Ativo\s+Circulante"],
-    "passivo_circulante": [r"Passivo\s+Circulante"],
-    "estoques": [r"Estoques"],
-    "caixa": [r"Caixa\s+e\s+equivalentes"],
-    "receita_liquida": [r"Receita\s+L[ií]quida"],
-    "lucro_bruto": [r"Lucro\s+Bruto"],
-    "ebit": [r"EBIT(?!DA)", r"Resultado\s+Operacional"],
-    "depreciacao": [r"Deprecia[cç][aã]o"],
-    "amortizacao": [r"Amortiza[cç][aã]o"],
-    "lucro_liquido": [r"Lucro\s+L[ií]quido"],
-    "lucro_por_acao": [r"Lucro\s+por\s+a[cç][aã]o"],
-    "qtd_acoes_total": [r"Quantidade\s+de\s+a[cç][oõ]es"],
-    "emprestimos_cp": [r"Empr[eé]stimos\s+e\s+financiamentos\s+CP"],
-    "emprestimos_lp": [r"Empr[eé]stimos\s+e\s+financiamentos\s+LP"],
-    "dividendos": [r"Dividendos"],
+SECTION_KEYWORDS = {
+    "balanco": ["balanço patrimonial", "balanco patrimonial"],
+    "dre": ["demonstração do resultado", "demonstracao do resultado"],
+    "dfc": ["demonstração dos fluxos de caixa", "demonstracao dos fluxos de caixa"],
+    "capital": ["composição do capital", "composicao do capital", "dados da empresa"],
+}
+IGNORED_KEYWORDS = ["relatório da administração", "relatorio da administracao", "notas explicativas"]
+
+FIELD_CODE_MAP = {
+    "1": "ativo_total",
+    "1.01": "ativo_circulante",
+    "1.01.01": "caixa",
+    "1.01.04": "estoques",
+    "2": "passivo_total",
+    "2.01": "passivo_circulante",
+    "2.03": "patrimonio_liquido",
+    "2.01.04": "emprestimos_cp",
+    "2.02.01": "emprestimos_lp",
+    "3.01": "receita_liquida",
+    "3.03": "lucro_bruto",
+    "3.05": "ebit",
+    "3.11": "lucro_liquido",
+}
+
+FIELD_DESC_MAP = {
+    "ativo_total": ["ativo total"],
+    "ativo_circulante": ["ativo circulante"],
+    "caixa": ["caixa e equivalentes de caixa", "caixa e equivalentes"],
+    "estoques": ["estoques"],
+    "passivo_total": ["passivo total"],
+    "passivo_circulante": ["passivo circulante"],
+    "patrimonio_liquido": ["patrimônio líquido", "patrimonio liquido"],
+    "receita_liquida": ["receita de venda de bens", "receita de venda de bens e/ou serviços"],
+    "lucro_bruto": ["resultado bruto", "lucro bruto"],
+    "ebit": ["resultado antes do resultado financeiro e dos tributos"],
+    "lucro_liquido": ["lucro/prejuízo do período", "lucro/prejuizo do periodo"],
 }
 
 
@@ -49,21 +66,17 @@ def _parse_value(text: str) -> Optional[float]:
     return -value if negative else value
 
 
-def _find_value(field: str, text: str) -> Optional[float]:
-    patterns = FIELD_PATTERNS.get(field, [])
-    for pattern in patterns:
-        regex = re.compile(rf"{pattern}.*?{VALUE_RE.pattern}", re.IGNORECASE)
-        match = regex.search(text)
-        if match:
-            return _parse_value(match.group(0))
-    return None
+def _extract_years_from_line(line: str) -> List[int]:
+    return [int(match) for match in DATE_RE.findall(line)]
 
 
-def _extract_year(text: str) -> Optional[int]:
-    years = [int(match) for match in YEAR_RE.findall(text)]
-    if not years:
-        return None
-    return max(years)
+def _extract_values_from_line(line: str) -> List[float]:
+    values: List[float] = []
+    for match in VALUE_RE.findall(line):
+        parsed = _parse_value(match)
+        if parsed is not None:
+            values.append(parsed)
+    return values
 
 
 def _extract_last_dividend(text: str) -> Tuple[Optional[float], Optional[str]]:
@@ -77,27 +90,130 @@ def _extract_last_dividend(text: str) -> Tuple[Optional[float], Optional[str]]:
     return value, date
 
 
-def parse_dfp_pdf(path: str) -> Tuple[Dict[str, Optional[float]], Optional[int], str, Optional[float], Optional[str]]:
+def _detect_section(text: str) -> Optional[str]:
+    lowered = text.lower()
+    if any(keyword in lowered for keyword in IGNORED_KEYWORDS):
+        return None
+    for section, keywords in SECTION_KEYWORDS.items():
+        if any(keyword in lowered for keyword in keywords):
+            return section
+    return None
+
+
+def _match_field_by_code(code: str) -> Optional[str]:
+    if code in FIELD_CODE_MAP:
+        return FIELD_CODE_MAP[code]
+    for prefix, field in FIELD_CODE_MAP.items():
+        if code.startswith(prefix + ".") and field == "lucro_liquido":
+            return field
+    return None
+
+
+def _match_field_by_desc(description: str) -> Optional[str]:
+    lowered = description.lower()
+    for field, keywords in FIELD_DESC_MAP.items():
+        if any(keyword in lowered for keyword in keywords):
+            return field
+    return None
+
+
+def _extract_code_and_description(line: str) -> Tuple[Optional[str], str]:
+    match = re.match(r"^\s*(\d(?:\.\d{2}){0,2})\s+(.*)$", line)
+    if match:
+        return match.group(1), match.group(2)
+    return None, line
+
+
+def _store_value(
+    target: Dict[int, Dict[str, Optional[float]]],
+    year: int,
+    field: str,
+    value: float,
+) -> None:
+    if year not in target:
+        target[year] = {}
+    if target[year].get(field) is None:
+        target[year][field] = value
+
+
+def parse_dfp_pdf(
+    path: str,
+) -> Tuple[Dict[int, Dict[str, Optional[float]]], str, Optional[float], Optional[str]]:
     logger.info("Parsing PDF %s", path)
-    data: Dict[str, Optional[float]] = {key: None for key in FIELD_PATTERNS}
     multiplier = 1.0
     currency_unit = "BRL"
+    parsed_by_year: Dict[int, Dict[str, Optional[float]]] = {}
 
     with pdfplumber.open(path) as pdf:
-        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        pages_text = [page.extract_text() or "" for page in pdf.pages]
+        full_text = "\n".join(pages_text)
 
     if MILLI_RE.search(full_text):
         multiplier = 1000.0
         currency_unit = "BRL_THOUSANDS"
 
-    for field in data:
-        value = _find_value(field, full_text)
-        if value is not None:
-            data[field] = value * multiplier
+    for page_text in pages_text:
+        section = _detect_section(page_text)
+        if not section:
+            continue
+        years: List[int] = []
+        for line in page_text.splitlines():
+            if not years:
+                years = _extract_years_from_line(line)
+            if not years:
+                continue
+            code, description = _extract_code_and_description(line)
+            field = _match_field_by_code(code) if code else None
+            if field is None:
+                field = _match_field_by_desc(description)
+            if field is None:
+                if section == "dfc" and "deprecia" in description.lower():
+                    field = "depreciacao"
+                else:
+                    continue
+            values = _extract_values_from_line(line)
+            if not values:
+                continue
+            if len(values) >= len(years):
+                values = values[-len(years) :]
+            if len(values) != len(years):
+                continue
+            for year, value in zip(years, values):
+                _store_value(parsed_by_year, year, field, value * multiplier)
+                if field == "depreciacao":
+                    _store_value(parsed_by_year, year, "amortizacao", 0.0)
 
-    year = _extract_year(full_text)
+        if section == "capital":
+            for line in page_text.splitlines():
+                if "total" in line.lower():
+                    values = _extract_values_from_line(line)
+                    if not values:
+                        continue
+                    year = years[0] if years else None
+                    if year:
+                        _store_value(parsed_by_year, year, "qtd_acoes_total", values[-1])
+                        break
+
     dividend_value, dividend_date = _extract_last_dividend(full_text)
     if dividend_value is not None:
         dividend_value = dividend_value * multiplier
 
-    return data, year, currency_unit, dividend_value, dividend_date
+    return parsed_by_year, currency_unit, dividend_value, dividend_date
+
+
+if __name__ == "__main__":
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description="Parse DFP PDF and print extracted fields by year")
+    parser.add_argument("pdf_path", help="Caminho do PDF DFP para parsing")
+    args = parser.parse_args()
+
+    parsed, currency_unit, dividend_value, dividend_date = parse_dfp_pdf(args.pdf_path)
+    output = {
+        "currency_unit": currency_unit,
+        "dividend_value": dividend_value,
+        "dividend_date": dividend_date,
+        "parsed_by_year": parsed,
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))

@@ -206,11 +206,11 @@ def process_row(
                 if not pdf_path.lower().endswith(".pdf"):
                     continue
                 try:
-                    parsed, year, unit, dividend_value, dividend_date = parse_dfp_pdf(full_path)
-                    raw_data = merge_raw_data(raw_data, parsed)
+                    parsed_by_year, unit, dividend_value, dividend_date = parse_dfp_pdf(full_path)
                     if unit == "BRL_THOUSANDS":
                         currency_unit = unit
-                    if year:
+                    for year, parsed in parsed_by_year.items():
+                        raw_data = merge_raw_data(raw_data, parsed)
                         if parsed.get("receita_liquida") is not None:
                             historical["receita_liquida"][str(year)] = parsed["receita_liquida"]
                         if parsed.get("lucro_liquido") is not None:
@@ -231,7 +231,7 @@ def process_row(
         result["raw_extracted"] = raw_data
         result["currency_unit"] = currency_unit
         result["historical"] = historical
-        result["normalized_financials"] = raw_data
+        result["normalized_financials"] = {str(year): data for year, data in raw_by_year.items()}
         result["raw_by_year"] = raw_by_year
 
         receita_series = {int(year): value for year, value in historical["receita_liquida"].items()}
