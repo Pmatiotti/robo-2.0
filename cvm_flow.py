@@ -12,6 +12,15 @@ class CvmFlow:
         self.page = page
         self.timeout_ms = timeout_ms
 
+    def _wait_for_overlay(self) -> None:
+        overlay = self.page.locator(".ui-widget-overlay.ui-front")
+        if overlay.count() == 0:
+            return
+        try:
+            overlay.wait_for(state="hidden", timeout=10000)
+        except Exception:
+            logger.debug("Overlay ainda visível, tentando continuar")
+
     def open_enet(self, codigo_cvm: str) -> None:
         url = f"{RAD_ENET_URL}?tipoconsulta=CVM&codigoCVM={codigo_cvm}"
         logger.info("Acessando ENET: %s", url)
@@ -39,7 +48,8 @@ class CvmFlow:
         chosen = self.page.locator("#cboCategorias_chosen")
         if chosen.count() == 0:
             raise ValueError("Não foi possível localizar seletor de categorias")
-        chosen.click()
+        self._wait_for_overlay()
+        chosen.click(no_wait_after=True)
         option = self.page.locator(
             "#cboCategorias_chosen .chosen-results li",
             has_text="DFP - Demonstrações Financeiras Padronizadas",
