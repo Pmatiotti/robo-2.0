@@ -16,11 +16,22 @@ def _build_zip_name(ticker: str, codigo_cvm: str, index: int) -> str:
     return f"{ticker}__{codigo_cvm}__{index:03d}.zip"
 
 
+def _wait_for_splash(page: Page) -> None:
+    splash = page.locator("#divSplash")
+    if splash.count() == 0:
+        return
+    try:
+        splash.wait_for(state="hidden", timeout=10000)
+    except Exception:
+        logger.debug("Splash overlay ainda visível, tentando clicar mesmo assim")
+
+
 def _download_single(page: Page, icon_locator, path: str, retries: int) -> None:
     for attempt in range(retries):
         try:
+            _wait_for_splash(page)
             with page.expect_download() as download_info:
-                icon_locator.click()
+                icon_locator.click(no_wait_after=True)
             download = download_info.value
             download.save_as(path)
 

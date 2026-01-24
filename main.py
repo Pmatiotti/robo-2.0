@@ -12,7 +12,7 @@ from playwright.sync_api import sync_playwright
 
 from cvm_flow import CvmFlow
 from download_manager import download_documents
-from indicators import calculate_indicators
+from indicators import calculate_indicators_by_year
 from moniitor_client import MoniitorClient
 from pdf_parser_dfp import parse_dfp_pdf
 from utils import (
@@ -158,6 +158,7 @@ def process_row(
         "dividendos": None,
     }
 
+    raw_by_year: Dict[int, Dict[str, Optional[float]]] = {}
     currency_unit = "BRL"
     historical = {"receita_liquida": {}, "lucro_liquido": {}}
     ultimo_dividendo = None
@@ -214,6 +215,9 @@ def process_row(
                             historical["receita_liquida"][str(year)] = parsed["receita_liquida"]
                         if parsed.get("lucro_liquido") is not None:
                             historical["lucro_liquido"][str(year)] = parsed["lucro_liquido"]
+                        if year not in raw_by_year:
+                            raw_by_year[year] = {}
+                        raw_by_year[year] = merge_raw_data(raw_by_year[year], parsed)
                     if ultimo_dividendo is None and dividend_value is not None:
                         ultimo_dividendo = dividend_value
                     if data_ultimo_dividendo is None and dividend_date is not None:
@@ -228,6 +232,7 @@ def process_row(
         result["currency_unit"] = currency_unit
         result["historical"] = historical
         result["normalized_financials"] = raw_data
+        result["raw_by_year"] = raw_by_year
 
         receita_series = {int(year): value for year, value in historical["receita_liquida"].items()}
         lucro_series = {int(year): value for year, value in historical["lucro_liquido"].items()}
@@ -238,44 +243,68 @@ def process_row(
         if not has_sufficient_series(lucro_series, years=5):
             result["missing_inputs"].append("serie_5y_incompleta")
 
-        indicators, missing_by_indicator, missing_inputs = calculate_indicators(
-            raw_data,
-            current_price,
-            market_cap,
-            enterprise_value,
-            dividendos_12m,
-            cagr_receitas_5,
-            cagr_lucros_5,
-        )
-
-        payload = {
-            "ticker": ticker,
-            "asset_class": asset_class,
-            "data_source": "cvm_dfp_bot",
+        market_data = {
             "current_price": current_price,
             "market_cap": market_cap,
             "enterprise_value": enterprise_value,
-            "dividend_yield": None,
-            "ultimo_dividendo": ultimo_dividendo,
-            "data_ultimo_dividendo": data_ultimo_dividendo,
-            **{k: v for k, v in indicators.items()},
+            "dividendos_12m": dividendos_12m,
         }
+        indicators_by_year, missing_by_indicator_by_year, missing_inputs_by_year, calc_trace_by_year = (
+            calculate_indicators_by_year(raw_by_year, market_data)
+        )
+
+        for year, indicators in indicators_by_year.items():
+            indicators["cagr_receitas_5"] = cagr_receitas_5
+            indicators["cagr_lucros_5"] = cagr_lucros_5
+            if cagr_receitas_5 is None:
+                missing_by_indicator_by_year.setdefault(year, {})["cagr_receitas_5"] = ["historical_receita_liquida"]
+            if cagr_lucros_5 is None:
+                missing_by_indicator_by_year.setdefault(year, {})["cagr_lucros_5"] = ["historical_lucro_liquido"]
+            missing_inputs_by_year.setdefault(year, [])
+            if cagr_receitas_5 is None and "historical_receita_liquida" not in missing_inputs_by_year[year]:
+                missing_inputs_by_year[year].append("historical_receita_liquida")
+            if cagr_lucros_5 is None and "historical_lucro_liquido" not in missing_inputs_by_year[year]:
+                missing_inputs_by_year[year].append("historical_lucro_liquido")
+
+        payloads = []
         liquidez_media_diaria = parse_decimal(row.get("liquidez_media_diaria"))
-        if liquidez_media_diaria is not None:
-            payload["liquidez_media_diaria"] = liquidez_media_diaria
-        result["moniitor_payload"] = payload
-        result["indicators"] = indicators
+        for year, indicators in indicators_by_year.items():
+            payload = {
+                "ticker": ticker,
+                "asset_class": asset_class,
+                "data_source": "cvm_dfp_bot",
+                "fiscal_year": year,
+                "current_price": current_price,
+                "market_cap": market_cap,
+                "enterprise_value": enterprise_value,
+                "dividend_yield": None,
+                "ultimo_dividendo": ultimo_dividendo,
+                "data_ultimo_dividendo": data_ultimo_dividendo,
+                **{k: v for k, v in indicators.items()},
+            }
+            if liquidez_media_diaria is not None:
+                payload["liquidez_media_diaria"] = liquidez_media_diaria
+            payloads.append(payload)
+        result["moniitor_payload"] = payloads
+        result["indicators"] = indicators_by_year
+        result["calc_trace_by_year"] = calc_trace_by_year
         result["dividends"] = {
             "ultimo_dividendo": ultimo_dividendo,
             "data_ultimo_dividendo": data_ultimo_dividendo,
         }
-        result["missing_inputs"].extend(missing_inputs)
-        result["missing_inputs"] = list(dict.fromkeys(result["missing_inputs"]))
-        result["missing_inputs_by_indicator"] = missing_by_indicator
+        result["missing_inputs_by_year"] = missing_inputs_by_year
+        result["missing_inputs_by_indicator_by_year"] = missing_by_indicator_by_year
+        aggregated_missing = set(result["missing_inputs"])
+        for missing_inputs in missing_inputs_by_year.values():
+            aggregated_missing.update(missing_inputs)
+        result["missing_inputs"] = list(aggregated_missing)
 
         try:
             client = MoniitorClient()
-            response = client.send_single(payload)
+            if payloads:
+                response = client.send_batch(payloads)
+            else:
+                response = {"error": "No fiscal year indicators to send"}
             result["moniitor_response"] = response
         except ValueError as exc:
             result["errors"].append(str(exc))
