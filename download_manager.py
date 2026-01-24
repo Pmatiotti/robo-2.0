@@ -127,11 +127,16 @@ def _download_single(page: Page, icon_locator, path: str, retries: int) -> None:
             clickable = icon_locator.locator("xpath=ancestor::a[1]")
             if clickable.count() == 0:
                 clickable = icon_locator.locator("xpath=ancestor::button[1]")
-            if clickable.count() == 0:
-                clickable = icon_locator.locator("xpath=ancestor::*[@onclick][1]")
             target = clickable.first if clickable.count() else icon_locator
 
-            onclick = target.get_attribute("onclick")
+            onclick = None
+            for _ in range(2):
+                onclick = icon_locator.evaluate(
+                    "el => el.closest('[onclick]')?.getAttribute('onclick') || null"
+                )
+                if onclick:
+                    break
+                time.sleep(0.2)
             if onclick:
                 logger.info("Onclick capturado: %s", onclick)
                 parsed = _parse_onclick_to_url(onclick)
@@ -203,9 +208,15 @@ def download_documents(
                 if match:
                     reference_date = match.group(0)
                     break
+        if reference_date:
+            logger.info("Data de referência capturada: %s", reference_date)
         logger.info("Baixando %s", filename)
-        _download_single(page, icon.first, dest_path, retries)
-        onclick = icon.locator("xpath=ancestor::*[@onclick][1]").get_attribute("onclick")
+        try:
+            _download_single(page, icon.first, dest_path, retries)
+        except Exception as exc:
+            logger.warning("Falha ao baixar documento %s: %s", filename, exc)
+            continue
+        onclick = icon.evaluate("el => el.closest('[onclick]')?.getAttribute('onclick') || null")
         metadata = _extract_onclick_metadata(onclick)
         downloads.append(
             {

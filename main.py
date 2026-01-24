@@ -231,11 +231,15 @@ def process_row(
                             prefer_consolidated=True,
                         )
                     else:
-                        result["errors"].append(
-                            f"Referencia ausente para XLSX em {os.path.basename(zip_path)}"
+                        logger.warning(
+                            "Referencia ausente para XLSX em %s, tentando inferir do XLSX",
+                            os.path.basename(zip_path),
                         )
-                        xlsx_raw_by_year = {}
-                        xlsx_currency_unit = "BRL"
+                        xlsx_raw_by_year, xlsx_currency_unit = parse_xlsx(
+                            excel_paths[0],
+                            None,
+                            prefer_consolidated=True,
+                        )
                     if xlsx_currency_unit == "BRL_THOUSANDS":
                         currency_unit = xlsx_currency_unit
                     for year, parsed in xlsx_raw_by_year.items():

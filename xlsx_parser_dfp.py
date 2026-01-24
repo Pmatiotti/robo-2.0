@@ -1,5 +1,6 @@
 import logging
 import re
+import unicodedata
 from typing import Dict, Optional, Tuple
 
 import pandas as pd
@@ -37,16 +38,31 @@ DESC_MAP = {
 }
 
 
+def _normalize_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value))
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    normalized = normalized.lower()
+    normalized = re.sub(r"[\s_\-]+", "_", normalized)
+    return normalized.strip("_")
+
+
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [str(col).strip().lower() for col in df.columns]
+    df.columns = [_normalize_text(col) for col in df.columns]
     return df
 
 
-def _get_column(df: pd.DataFrame, *names: str) -> Optional[str]:
-    for name in names:
-        if name in df.columns:
-            return name
+def _normalize_sheet_name(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(name))
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    normalized = normalized.lower()
+    return re.sub(r"[\s_\-]+", "", normalized)
+
+
+def _get_column_by_tokens(df: pd.DataFrame, *tokens: str) -> Optional[str]:
+    for col in df.columns:
+        if all(token in col for token in tokens):
+            return col
     return None
 
 
@@ -93,44 +109,65 @@ def _match_field(code: Optional[str], description: Optional[str]) -> Optional[st
 
 def parse_xlsx(
     path_xlsx: str,
-    reference_year: int,
+    reference_year: Optional[int],
     prefer_consolidated: bool = True,
 ) -> Tuple[Dict[int, Dict[str, Optional[float]]], str]:
     sheets = pd.read_excel(path_xlsx, sheet_name=None)
     currency_unit = "BRL"
     raw_by_year: Dict[int, Dict[str, Optional[float]]] = {}
 
-    def select_sheet(prefix: str) -> Optional[str]:
-        options = []
-        for name in sheets:
-            if name.lower().startswith(prefix.lower()):
-                options.append(name)
-        if not options:
-            return None
-        return options[0]
+    normalized_sheets = {name: _normalize_sheet_name(name) for name in sheets}
+    logger.info("Sheets encontradas: %s", list(sheets.keys()))
+    candidates = []
+    for name, normalized in normalized_sheets.items():
+        scope = "cons" if "cons" in normalized else "ind" if "ind" in normalized else None
+        kind = None
+        for key in ["ativo", "passivo", "resultado", "fluxo"]:
+            if key in normalized:
+                kind = key
+                break
+        candidates.append((name, scope, kind))
 
-    if prefer_consolidated:
-        sheet_prefixes = ["df cons", "df ind"]
+    preferred_scope = "cons" if prefer_consolidated else "ind"
+    preferred = [name for name, scope, _ in candidates if scope == preferred_scope]
+    fallback = [name for name, scope, _ in candidates if scope != preferred_scope]
+    sheet_names = preferred or fallback
+    logger.info("Sheets usadas: %s", sheet_names)
+
+    if reference_year is None:
+        year_candidates = []
+        for df in sheets.values():
+            for value in df.select_dtypes(include=["object"]).stack().dropna().astype(str):
+                match = re.search(r"31/12/(\d{4})", value)
+                if match:
+                    year_candidates.append(int(match.group(1)))
+        if year_candidates:
+            reference_year = max(year_candidates)
+            logger.info("Reference year inferido do XLSX: %s", reference_year)
+    if reference_year is None:
+        logger.warning("Reference year não encontrado no XLSX.")
     else:
-        sheet_prefixes = ["df ind", "df cons"]
-
-    sheet_names = []
-    for prefix in sheet_prefixes:
-        for name in sheets:
-            if name.lower().startswith(prefix):
-                sheet_names.append(name)
-        if sheet_names:
-            break
+        logger.info("Reference year final: %s", reference_year)
 
     used_sheets = []
     for sheet_name in sheet_names:
         df = _normalize_columns(sheets[sheet_name])
-        code_col = _get_column(df, "código conta", "codigo conta")
-        desc_col = _get_column(df, "descrição conta", "descricao conta")
-        last_col = _get_column(df, "valor ultimo exercicio", "valor último exercicio")
-        prev_col = _get_column(df, "valor penultimo exercicio", "valor penúltimo exercicio")
-        prev2_col = _get_column(df, "valor antepenultimo exercicio", "valor antepenúltimo exercicio")
-        precision_col = _get_column(df, "precisao", "precisão")
+        code_col = _get_column_by_tokens(df, "codigo")
+        desc_col = _get_column_by_tokens(df, "descricao")
+        last_col = _get_column_by_tokens(df, "ultimo")
+        prev_col = _get_column_by_tokens(df, "penultimo")
+        prev2_col = _get_column_by_tokens(df, "antepenultimo")
+        precision_col = _get_column_by_tokens(df, "precisao") or _get_column_by_tokens(df, "unidade") or _get_column_by_tokens(df, "escala")
+        logger.info(
+            "Sheet %s colunas: code=%s desc=%s last=%s prev=%s prev2=%s precision=%s",
+            sheet_name,
+            code_col,
+            desc_col,
+            last_col,
+            prev_col,
+            prev2_col,
+            precision_col,
+        )
         if not (last_col and prev_col and prev2_col):
             continue
         used_sheets.append(sheet_name)
@@ -145,12 +182,12 @@ def parse_xlsx(
                 currency_unit = "BRL_THOUSANDS"
 
             values = {
-                reference_year: _parse_number(row.get(last_col)),
-                reference_year - 1: _parse_number(row.get(prev_col)),
-                reference_year - 2: _parse_number(row.get(prev2_col)),
+                reference_year: _parse_number(row.get(last_col)) if reference_year else None,
+                (reference_year - 1) if reference_year else None: _parse_number(row.get(prev_col)),
+                (reference_year - 2) if reference_year else None: _parse_number(row.get(prev2_col)),
             }
             for year, value in values.items():
-                if value is None:
+                if value is None or year is None:
                     continue
                 raw_by_year.setdefault(year, {})
                 if raw_by_year[year].get(field) is None:
@@ -166,6 +203,8 @@ def parse_xlsx(
         logger.info("XLSX campos preenchidos %s: %s", year, ", ".join(sorted(filled.keys())))
         for field in ["ativo_total", "passivo_total", "patrimonio_liquido", "receita_liquida", "lucro_liquido"]:
             logger.info("XLSX %s %s: %s", year, field, data.get(field))
+    if raw_by_year:
+        logger.info("Anos gerados: %s", sorted(raw_by_year.keys()))
 
     critical_values = [
         data.get(field)
@@ -179,12 +218,14 @@ def parse_xlsx(
             df_sample = _normalize_columns(sheets[used_sheets[0]])
             logger.warning(
                 "Colunas detectadas: code=%s desc=%s last=%s prev=%s prev2=%s precision=%s",
-                _get_column(df_sample, "código conta", "codigo conta"),
-                _get_column(df_sample, "descrição conta", "descricao conta"),
-                _get_column(df_sample, "valor ultimo exercicio", "valor último exercicio"),
-                _get_column(df_sample, "valor penultimo exercicio", "valor penúltimo exercicio"),
-                _get_column(df_sample, "valor antepenultimo exercicio", "valor antepenúltimo exercicio"),
-                _get_column(df_sample, "precisao", "precisão"),
+                _get_column_by_tokens(df_sample, "codigo"),
+                _get_column_by_tokens(df_sample, "descricao"),
+                _get_column_by_tokens(df_sample, "ultimo"),
+                _get_column_by_tokens(df_sample, "penultimo"),
+                _get_column_by_tokens(df_sample, "antepenultimo"),
+                _get_column_by_tokens(df_sample, "precisao")
+                or _get_column_by_tokens(df_sample, "unidade")
+                or _get_column_by_tokens(df_sample, "escala"),
             )
             logger.warning("Amostra linhas: %s", df_sample.head(3).to_dict(orient="records"))
 
