@@ -1,6 +1,7 @@
 import logging
 import os
-from typing import List
+import re
+from typing import Dict, List, Optional
 
 from playwright.sync_api import Page
 
@@ -10,6 +11,7 @@ from zip_extract import validate_zip
 logger = logging.getLogger(__name__)
 
 DOWNLOAD_ICON_SELECTOR = "i.fi-download[title='Download']"
+DATE_RE = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
 
 
 def _build_zip_name(ticker: str, codigo_cvm: str, index: int) -> str:
@@ -50,7 +52,7 @@ def download_documents(
     codigo_cvm: str,
     downloads_dir: str,
     retries: int = 3,
-) -> List[str]:
+) -> List[Dict[str, Optional[str]]]:
     ensure_dir(downloads_dir)
     rows = page.locator("tr").filter(has=page.locator(DOWNLOAD_ICON_SELECTOR))
     row_count = rows.count()
@@ -60,7 +62,7 @@ def download_documents(
 
     active_count = 0
     inactive_count = 0
-    paths: List[str] = []
+    downloads: List[Dict[str, Optional[str]]] = []
     for idx in range(row_count):
         row = rows.nth(idx)
         cells = [text.strip() for text in row.locator("td").all_inner_texts()]
@@ -80,11 +82,17 @@ def download_documents(
         active_count += 1
         filename = _build_zip_name(ticker, codigo_cvm, idx + 1)
         dest_path = os.path.join(downloads_dir, filename)
+        reference_date = None
+        for cell in cells:
+            match = DATE_RE.search(cell)
+            if match:
+                reference_date = match.group(0)
+                break
         logger.info("Baixando %s", filename)
         _download_single(page, icon.first, dest_path, retries)
-        paths.append(dest_path)
+        downloads.append({"zip_path": dest_path, "reference_date": reference_date})
 
     logger.info("Documentos ativos: %s | ignorados por status: %s", active_count, inactive_count)
     if active_count == 0:
         logger.warning("Nenhum documento com status Ativo encontrado")
-    return paths
+    return downloads

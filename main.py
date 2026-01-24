@@ -15,6 +15,7 @@ from download_manager import download_documents
 from indicators import calculate_indicators_by_year
 from moniitor_client import MoniitorClient
 from pdf_parser_dfp import parse_dfp_pdf
+from xlsx_parser_dfp import parse_xlsx
 from utils import (
     calculate_cagr,
     ensure_dir,
@@ -23,7 +24,7 @@ from utils import (
     setup_logging,
     sha256_file,
 )
-from zip_extract import extract_zip
+from zip_extract import copy_excels, extract_zip
 
 load_dotenv()
 
@@ -108,9 +109,11 @@ def process_row(
     downloads_dir = os.path.join(output_root, "downloads")
     extracted_dir = os.path.join(output_root, "extracted")
     pdf_dir = os.path.join(output_root, "pdfs")
+    excel_dir = os.path.join(output_root, "excels")
     ensure_dir(downloads_dir)
     ensure_dir(extracted_dir)
     ensure_dir(pdf_dir)
+    ensure_dir(excel_dir)
 
     result: Dict[str, Any] = {
         "ticker": ticker,
@@ -164,6 +167,7 @@ def process_row(
     ultimo_dividendo = None
     data_ultimo_dividendo = None
     has_parsing_errors = False
+    used_xlsx = False
 
     if not cod_cvm:
         message = "Código CVM ausente no CSV"
@@ -182,15 +186,18 @@ def process_row(
             flow.open_enet(cod_cvm)
             flow.apply_filters(start_date, end_date)
 
-            zip_paths = download_documents(
+            downloads = download_documents(
                 page, ticker, cod_cvm, downloads_dir, retries=max_retries
             )
-            if not zip_paths:
+            if not downloads:
                 result["errors"].append("Nenhum ZIP encontrado")
 
-            for zip_path in zip_paths:
+            for download in downloads:
+                zip_path = download["zip_path"]
+                reference_date = download.get("reference_date")
                 extracted = extract_zip(zip_path, extracted_dir)
-                pdfs = collect_pdfs(extracted, pdf_dir)
+                excel_paths = copy_excels(extracted["xlsx_paths"], excel_dir)
+                pdfs = collect_pdfs(extracted["extracted"], pdf_dir)
                 sha = sha256_file(zip_path)
                 result["documents"].append(
                     {
@@ -198,40 +205,69 @@ def process_row(
                         "sha256": sha,
                         "size_bytes": os.path.getsize(zip_path),
                         "pdfs_extracted": len(pdfs),
+                        "reference_date": reference_date,
                     }
                 )
-
-            for pdf_path in os.listdir(pdf_dir):
-                full_path = os.path.join(pdf_dir, pdf_path)
-                if not pdf_path.lower().endswith(".pdf"):
-                    continue
-                try:
-                    parsed_by_year, unit, dividend_value, dividend_date = parse_dfp_pdf(
-                        full_path,
-                        {
-                            "output_root": output_root,
-                            "ticker": ticker,
-                            "codigo_cvm": cod_cvm,
-                        },
+                if excel_paths:
+                    logger.info(
+                        "XLSX encontrado para %s: %s", os.path.basename(zip_path), excel_paths[0]
                     )
-                    if unit == "BRL_THOUSANDS":
-                        currency_unit = unit
-                    for year, parsed in parsed_by_year.items():
-                        raw_data = merge_raw_data(raw_data, parsed)
-                        if parsed.get("receita_liquida") is not None:
-                            historical["receita_liquida"][str(year)] = parsed["receita_liquida"]
-                        if parsed.get("lucro_liquido") is not None:
-                            historical["lucro_liquido"][str(year)] = parsed["lucro_liquido"]
-                        if year not in raw_by_year:
-                            raw_by_year[year] = {}
-                        raw_by_year[year] = merge_raw_data(raw_by_year[year], parsed)
-                    if ultimo_dividendo is None and dividend_value is not None:
-                        ultimo_dividendo = dividend_value
-                    if data_ultimo_dividendo is None and dividend_date is not None:
-                        data_ultimo_dividendo = dividend_date
-                except Exception as exc:
-                    has_parsing_errors = True
-                    result["errors"].append(f"Erro parse PDF {pdf_path}: {exc}")
+                    if reference_date:
+                        reference_year = int(reference_date.split("/")[-1])
+                        xlsx_raw_by_year, xlsx_currency_unit = parse_xlsx(
+                            excel_paths[0],
+                            reference_year,
+                            prefer_consolidated=True,
+                        )
+                        if xlsx_currency_unit == "BRL_THOUSANDS":
+                            currency_unit = xlsx_currency_unit
+                        for year, parsed in xlsx_raw_by_year.items():
+                            raw_data = merge_raw_data(raw_data, parsed)
+                            if parsed.get("receita_liquida") is not None:
+                                historical["receita_liquida"][str(year)] = parsed["receita_liquida"]
+                            if parsed.get("lucro_liquido") is not None:
+                                historical["lucro_liquido"][str(year)] = parsed["lucro_liquido"]
+                            raw_by_year.setdefault(year, {})
+                            raw_by_year[year] = merge_raw_data(raw_by_year[year], parsed)
+                        if xlsx_raw_by_year:
+                            used_xlsx = True
+                    else:
+                        result["errors"].append(
+                            f"Referencia ausente para XLSX em {os.path.basename(zip_path)}"
+                        )
+
+            if not used_xlsx:
+                for pdf_path in os.listdir(pdf_dir):
+                    full_path = os.path.join(pdf_dir, pdf_path)
+                    if not pdf_path.lower().endswith(".pdf"):
+                        continue
+                    try:
+                        parsed_by_year, unit, dividend_value, dividend_date = parse_dfp_pdf(
+                            full_path,
+                            {
+                                "output_root": output_root,
+                                "ticker": ticker,
+                                "codigo_cvm": cod_cvm,
+                            },
+                        )
+                        if unit == "BRL_THOUSANDS":
+                            currency_unit = unit
+                        for year, parsed in parsed_by_year.items():
+                            raw_data = merge_raw_data(raw_data, parsed)
+                            if parsed.get("receita_liquida") is not None:
+                                historical["receita_liquida"][str(year)] = parsed["receita_liquida"]
+                            if parsed.get("lucro_liquido") is not None:
+                                historical["lucro_liquido"][str(year)] = parsed["lucro_liquido"]
+                            if year not in raw_by_year:
+                                raw_by_year[year] = {}
+                            raw_by_year[year] = merge_raw_data(raw_by_year[year], parsed)
+                        if ultimo_dividendo is None and dividend_value is not None:
+                            ultimo_dividendo = dividend_value
+                        if data_ultimo_dividendo is None and dividend_date is not None:
+                            data_ultimo_dividendo = dividend_date
+                    except Exception as exc:
+                        has_parsing_errors = True
+                        result["errors"].append(f"Erro parse PDF {pdf_path}: {exc}")
 
             browser.close()
 
