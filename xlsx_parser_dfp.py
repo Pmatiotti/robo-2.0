@@ -1,6 +1,7 @@
 import logging
 import re
 import unicodedata
+from datetime import datetime
 from typing import Dict, Optional, Tuple
 
 import pandas as pd
@@ -94,6 +95,79 @@ def _parse_number(value: Optional[float]) -> Optional[float]:
     return -parsed if negative else parsed
 
 
+def _normalize_year(year: int) -> int:
+    if year < 100:
+        if year <= 79:
+            return 2000 + year
+        return 1900 + year
+    return year
+
+
+def _parse_date_to_year(value: object) -> Optional[int]:
+    if isinstance(value, datetime):
+        return value.year
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime().year
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.search(r"(\d{2})/(\d{2})/(\d{2,4})", text)
+    if match:
+        year = int(match.group(3))
+        return _normalize_year(year)
+    match = re.search(r"(\d{4})", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _infer_base_year_from_df(df: pd.DataFrame) -> Optional[int]:
+    candidates = [
+        "ultimo_exercicio",
+        "data_ultimo_exercicio",
+        "data_do_ultimo_exercicio",
+        "dt_ultimo_exercicio",
+        "data_fim_exercicio",
+        "data_referencia",
+    ]
+    for column in df.columns:
+        if any(candidate in column for candidate in candidates):
+            series = df[column].dropna()
+            if series.empty:
+                continue
+            for value in series.head(10):
+                year = _parse_date_to_year(value)
+                if year:
+                    return year
+    return None
+
+
+def infer_workbook_base_year(
+    sheets: Dict[str, pd.DataFrame],
+    reference_year: Optional[int],
+) -> Tuple[Optional[int], str]:
+    capital_sheets = []
+    for name, df in sheets.items():
+        normalized = _normalize_sheet_name(name)
+        if "composicaocapital" in normalized:
+            capital_sheets.append(df)
+    for df in capital_sheets:
+        df_norm = _normalize_columns(df)
+        year = _infer_base_year_from_df(df_norm)
+        if year:
+            return year, "xlsx:composicao_capital"
+
+    for df in sheets.values():
+        df_norm = _normalize_columns(df)
+        year = _infer_base_year_from_df(df_norm)
+        if year:
+            return year, "xlsx:generic_date_col"
+
+    if reference_year:
+        return reference_year, "enet:reference_year"
+    return None, "none"
+
+
 def _match_field(code: Optional[str], description: Optional[str]) -> Optional[str]:
     if code:
         code = str(code).strip()
@@ -134,24 +208,29 @@ def parse_xlsx(
     sheet_names = preferred or fallback
     logger.info("Sheets usadas: %s", sheet_names)
 
-    if reference_year is None:
-        year_candidates = []
-        for df in sheets.values():
-            for value in df.select_dtypes(include=["object"]).stack().dropna().astype(str):
-                match = re.search(r"31/12/(\d{4})", value)
-                if match:
-                    year_candidates.append(int(match.group(1)))
-        if year_candidates:
-            reference_year = max(year_candidates)
-            logger.info("Reference year inferido do XLSX: %s", reference_year)
-    if reference_year is None:
+    workbook_base_year, base_source = infer_workbook_base_year(sheets, reference_year)
+    if workbook_base_year is None:
         logger.warning("Reference year não encontrado no XLSX.")
     else:
-        logger.info("Reference year final: %s", reference_year)
+        logger.info("Base year workbook=%s source=%s", workbook_base_year, base_source)
 
     used_sheets = []
     for sheet_name in sheet_names:
         df = _normalize_columns(sheets[sheet_name])
+        inferred_year = _infer_base_year_from_df(df)
+        base_year = workbook_base_year
+        fallback_used = inferred_year is None and base_source.startswith("enet")
+        current_year = datetime.utcnow().year
+        if base_year and (base_year > current_year + 1 or base_year < 1990):
+            base_year = reference_year
+            fallback_used = True
+        logger.info(
+            "Sheet %s base_year=%s fallback_used=%s inferred_sheet_year=%s",
+            sheet_name,
+            base_year,
+            fallback_used,
+            inferred_year,
+        )
         code_col = _get_column_by_tokens(df, "codigo")
         desc_col = _get_column_by_tokens(df, "descricao")
         last_col = _get_column_by_tokens(df, "ultimo")
@@ -182,9 +261,9 @@ def parse_xlsx(
                 currency_unit = "BRL_THOUSANDS"
 
             values = {
-                reference_year: _parse_number(row.get(last_col)) if reference_year else None,
-                (reference_year - 1) if reference_year else None: _parse_number(row.get(prev_col)),
-                (reference_year - 2) if reference_year else None: _parse_number(row.get(prev2_col)),
+                base_year: _parse_number(row.get(last_col)) if base_year else None,
+                (base_year - 1) if base_year else None: _parse_number(row.get(prev_col)),
+                (base_year - 2) if base_year else None: _parse_number(row.get(prev2_col)),
             }
             for year, value in values.items():
                 if value is None or year is None:
@@ -197,6 +276,12 @@ def parse_xlsx(
 
         if sample_matches:
             logger.info("Sheet %s: amostras %s", sheet_name, sample_matches[:5])
+
+    if workbook_base_year:
+        logger.info(
+            "Anos gerados (base workbook): %s",
+            [workbook_base_year, workbook_base_year - 1, workbook_base_year - 2],
+        )
 
     for year, data in raw_by_year.items():
         filled = {key: value for key, value in data.items() if value is not None}
