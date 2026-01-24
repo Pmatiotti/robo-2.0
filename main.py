@@ -206,7 +206,14 @@ def process_row(
                 if not pdf_path.lower().endswith(".pdf"):
                     continue
                 try:
-                    parsed_by_year, unit, dividend_value, dividend_date = parse_dfp_pdf(full_path)
+                    parsed_by_year, unit, dividend_value, dividend_date = parse_dfp_pdf(
+                        full_path,
+                        {
+                            "output_root": output_root,
+                            "ticker": ticker,
+                            "codigo_cvm": cod_cvm,
+                        },
+                    )
                     if unit == "BRL_THOUSANDS":
                         currency_unit = unit
                     for year, parsed in parsed_by_year.items():

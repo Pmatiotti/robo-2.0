@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -6,7 +8,7 @@ import pdfplumber
 
 logger = logging.getLogger(__name__)
 
-VALUE_RE = re.compile(r"(\(?-?\d{1,3}(?:\.\d{3})*,\d+\)?)")
+VALUE_RE = re.compile(r"\(?-?\d{1,3}(?:\.\d{3})*(?:,\d+)?\)?")
 MILLI_RE = re.compile(r"(reais\s*mil|em\s*milhares)", re.IGNORECASE)
 DATE_RE = re.compile(r"31/12/(20\d{2})")
 DIVIDEND_VALUE_RE = re.compile(r"(dividendos?|jcp|juros\s+sobre\s+capital).*?([\\d\\.]+,\\d+)", re.IGNORECASE)
@@ -19,6 +21,8 @@ SECTION_KEYWORDS = {
     "capital": ["composição do capital", "composicao do capital", "dados da empresa"],
 }
 IGNORED_KEYWORDS = ["relatório da administração", "relatorio da administracao", "notas explicativas"]
+CONSOLIDATED_KEYWORDS = ["consolidado", "consolidadas", "dfs consolidadas"]
+INDIVIDUAL_KEYWORDS = ["individual", "individuais", "dfs individuais"]
 
 FIELD_CODE_MAP = {
     "1": "ativo_total",
@@ -52,13 +56,16 @@ FIELD_DESC_MAP = {
 
 
 def _parse_value(text: str) -> Optional[float]:
-    match = VALUE_RE.search(text)
+    match = VALUE_RE.search(text.replace(" ", ""))
     if not match:
         return None
-    raw = match.group(1)
+    raw = match.group(0)
     negative = raw.startswith("(") and raw.endswith(")")
     cleaned = raw.strip("()")
-    cleaned = cleaned.replace(".", "").replace(",", ".")
+    if "," in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    else:
+        cleaned = cleaned.replace(".", "")
     try:
         value = float(cleaned)
     except ValueError:
@@ -72,7 +79,7 @@ def _extract_years_from_line(line: str) -> List[int]:
 
 def _extract_values_from_line(line: str) -> List[float]:
     values: List[float] = []
-    for match in VALUE_RE.findall(line):
+    for match in VALUE_RE.findall(line.replace(" ", "")):
         parsed = _parse_value(match)
         if parsed is not None:
             values.append(parsed)
@@ -97,6 +104,15 @@ def _detect_section(text: str) -> Optional[str]:
     for section, keywords in SECTION_KEYWORDS.items():
         if any(keyword in lowered for keyword in keywords):
             return section
+    return None
+
+
+def _detect_scope(text: str) -> Optional[str]:
+    lowered = text.lower()
+    if any(keyword in lowered for keyword in CONSOLIDATED_KEYWORDS):
+        return "consolidado"
+    if any(keyword in lowered for keyword in INDIVIDUAL_KEYWORDS):
+        return "individual"
     return None
 
 
@@ -138,11 +154,13 @@ def _store_value(
 
 def parse_dfp_pdf(
     path: str,
+    debug_context: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[int, Dict[str, Optional[float]]], str, Optional[float], Optional[str]]:
     logger.info("Parsing PDF %s", path)
     multiplier = 1.0
     currency_unit = "BRL"
     parsed_by_year: Dict[int, Dict[str, Optional[float]]] = {}
+    lines_used: List[str] = []
 
     with pdfplumber.open(path) as pdf:
         pages_text = [page.extract_text() or "" for page in pdf.pages]
@@ -152,7 +170,19 @@ def parse_dfp_pdf(
         multiplier = 1000.0
         currency_unit = "BRL_THOUSANDS"
 
-    for page_text in pages_text:
+    page_scopes = [_detect_scope(text) for text in pages_text]
+    has_consolidated = any(scope == "consolidado" for scope in page_scopes)
+    has_individual = any(scope == "individual" for scope in page_scopes)
+    if has_consolidated:
+        selected_scopes = {"consolidado"}
+    elif has_individual:
+        selected_scopes = {"individual"}
+    else:
+        selected_scopes = {None}
+
+    for page_text, scope in zip(pages_text, page_scopes):
+        if scope not in selected_scopes:
+            continue
         section = _detect_section(page_text)
         if not section:
             continue
@@ -173,11 +203,14 @@ def parse_dfp_pdf(
                     continue
             values = _extract_values_from_line(line)
             if not values:
+                logger.debug("Linha relevante sem valores: %s", line)
                 continue
             if len(values) >= len(years):
                 values = values[-len(years) :]
             if len(values) != len(years):
+                logger.debug("Linha com valores não alinhados aos anos: %s", line)
                 continue
+            lines_used.append(line.strip())
             for year, value in zip(years, values):
                 _store_value(parsed_by_year, year, field, value * multiplier)
                 if field == "depreciacao":
@@ -192,11 +225,41 @@ def parse_dfp_pdf(
                     year = years[0] if years else None
                     if year:
                         _store_value(parsed_by_year, year, "qtd_acoes_total", values[-1])
+                        lines_used.append(line.strip())
                         break
 
     dividend_value, dividend_date = _extract_last_dividend(full_text)
     if dividend_value is not None:
         dividend_value = dividend_value * multiplier
+
+    detected_years = sorted(parsed_by_year.keys())
+    logger.info(
+        "Escopo detectado: %s",
+        "consolidado" if has_consolidated else "individual" if has_individual else "indefinido",
+    )
+    logger.info("Anos detectados no PDF: %s", detected_years)
+    for year in detected_years:
+        filled_fields = [field for field, value in parsed_by_year.get(year, {}).items() if value is not None]
+        logger.info("Campos preenchidos %s: %s", year, ", ".join(sorted(filled_fields)))
+
+    if debug_context and os.getenv("PARSE_DEBUG") == "1":
+        output_root = debug_context.get("output_root")
+        ticker = debug_context.get("ticker", "unknown")
+        codigo_cvm = debug_context.get("codigo_cvm", "unknown")
+        if output_root:
+            debug_path = os.path.join(output_root, f"parse_debug_{ticker}_{codigo_cvm}.json")
+            with open(debug_path, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "detected_scope": "consolidado" if has_consolidated else "individual" if has_individual else "indefinido",
+                        "detected_years": detected_years,
+                        "raw_by_year": parsed_by_year,
+                        "lines_used": lines_used[:100],
+                    },
+                    handle,
+                    ensure_ascii=False,
+                    indent=2,
+                )
 
     return parsed_by_year, currency_unit, dividend_value, dividend_date
 
