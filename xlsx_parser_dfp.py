@@ -22,6 +22,7 @@ CODE_MAP = {
     "3.03": "lucro_bruto",
     "3.05": "ebit",
     "3.11": "lucro_liquido",
+    "6.01.01.04": "depreciacao",
 }
 
 DESC_MAP = {
@@ -168,6 +169,56 @@ def infer_workbook_base_year(
     return None, "none"
 
 
+def _infer_base_year_from_sheet(
+    df: pd.DataFrame,
+    sheet_norm_name: str,
+    reference_year: Optional[int],
+) -> Tuple[Optional[int], bool]:
+    inferred_year = _infer_base_year_from_df(df)
+    if inferred_year:
+        return inferred_year, False
+    for _, row in df.dropna(how="all").head(3).iterrows():
+        for value in row.values:
+            year = _parse_date_to_year(value)
+            if year:
+                return year, False
+    return reference_year, True
+
+
+def _populate_share_counts(
+    raw_by_year: Dict[int, Dict[str, Optional[float]]],
+    df: pd.DataFrame,
+) -> None:
+    ultimo_col = _get_column_by_tokens(df, "ultimo", "exercicio")
+    issued_col = _get_column_by_tokens(df, "total", "capital", "integralizado")
+    treasury_col = _get_column_by_tokens(df, "total", "tesouraria")
+    precision_col = _get_column_by_tokens(df, "precisao") or _get_column_by_tokens(df, "unidade")
+    if not (ultimo_col and issued_col):
+        return
+    multiplier = _parse_precision(df.get(precision_col).iloc[0] if precision_col else None)
+    for _, row in df.iterrows():
+        year = _parse_date_to_year(row.get(ultimo_col))
+        if year is None:
+            continue
+        shares_issued = _parse_number(row.get(issued_col))
+        shares_treasury = _parse_number(row.get(treasury_col)) if treasury_col else None
+        if shares_issued is None:
+            continue
+        shares_issued *= multiplier
+        if shares_treasury is not None:
+            shares_treasury *= multiplier
+        shares_outstanding = None
+        if shares_treasury is not None and shares_issued >= shares_treasury:
+            shares_outstanding = shares_issued - shares_treasury
+        raw_by_year.setdefault(year, {})
+        if shares_outstanding is not None and raw_by_year[year].get("qtd_acoes_total") is None:
+            raw_by_year[year]["qtd_acoes_total"] = shares_outstanding
+        if raw_by_year[year].get("qtd_acoes_emitidas") is None:
+            raw_by_year[year]["qtd_acoes_emitidas"] = shares_issued
+        if shares_treasury is not None and raw_by_year[year].get("qtd_acoes_tesouraria") is None:
+            raw_by_year[year]["qtd_acoes_tesouraria"] = shares_treasury
+
+
 def _match_field(code: Optional[str], description: Optional[str]) -> Optional[str]:
     if code:
         code = str(code).strip()
@@ -213,13 +264,21 @@ def parse_xlsx(
         logger.warning("Reference year não encontrado no XLSX.")
     else:
         logger.info("Base year workbook=%s source=%s", workbook_base_year, base_source)
+    if workbook_base_year:
+        logger.info(
+            "Anos gerados (base workbook): %s",
+            [workbook_base_year, workbook_base_year - 1, workbook_base_year - 2],
+        )
+
+    for name, normalized in normalized_sheets.items():
+        if "composicaocapital" in normalized:
+            df_capital = _normalize_columns(sheets[name])
+            _populate_share_counts(raw_by_year, df_capital)
 
     used_sheets = []
     for sheet_name in sheet_names:
         df = _normalize_columns(sheets[sheet_name])
-        inferred_year = _infer_base_year_from_df(df)
-        base_year = workbook_base_year
-        fallback_used = inferred_year is None and base_source.startswith("enet")
+        base_year, fallback_used = _infer_base_year_from_sheet(df, normalized_sheets[sheet_name], reference_year)
         current_year = datetime.utcnow().year
         if base_year and (base_year > current_year + 1 or base_year < 1990):
             base_year = reference_year
@@ -229,7 +288,7 @@ def parse_xlsx(
             sheet_name,
             base_year,
             fallback_used,
-            inferred_year,
+            _infer_base_year_from_df(df),
         )
         code_col = _get_column_by_tokens(df, "codigo")
         desc_col = _get_column_by_tokens(df, "descricao")
@@ -255,7 +314,11 @@ def parse_xlsx(
         for _, row in df.iterrows():
             field = _match_field(row.get(code_col), row.get(desc_col))
             if not field:
-                continue
+                desc_text = str(row.get(desc_col) or "").lower()
+                if "deprecia" in desc_text and "amort" in desc_text:
+                    field = "depreciacao"
+                else:
+                    continue
             multiplier = _parse_precision(row.get(precision_col))
             if multiplier == 1000:
                 currency_unit = "BRL_THOUSANDS"
@@ -271,25 +334,34 @@ def parse_xlsx(
                 raw_by_year.setdefault(year, {})
                 if raw_by_year[year].get(field) is None:
                     raw_by_year[year][field] = value * multiplier
+                    if field == "depreciacao" and raw_by_year[year].get("amortizacao") is None:
+                        raw_by_year[year]["amortizacao"] = 0.0
+                        logger.info("D&A encontrado em %s (%s): %s", sheet_name, field, raw_by_year[year][field])
                     if field in {"ativo_total", "passivo_total", "patrimonio_liquido", "receita_liquida", "lucro_liquido"}:
                         sample_matches.append((field, year, raw_by_year[year][field]))
 
         if sample_matches:
             logger.info("Sheet %s: amostras %s", sheet_name, sample_matches[:5])
 
-    if workbook_base_year:
-        logger.info(
-            "Anos gerados (base workbook): %s",
-            [workbook_base_year, workbook_base_year - 1, workbook_base_year - 2],
-        )
-
     for year, data in raw_by_year.items():
         filled = {key: value for key, value in data.items() if value is not None}
         logger.info("XLSX campos preenchidos %s: %s", year, ", ".join(sorted(filled.keys())))
-        for field in ["ativo_total", "passivo_total", "patrimonio_liquido", "receita_liquida", "lucro_liquido"]:
+        for field in [
+            "ativo_total",
+            "passivo_total",
+            "patrimonio_liquido",
+            "receita_liquida",
+            "lucro_liquido",
+            "qtd_acoes_total",
+            "ebit",
+            "depreciacao",
+            "amortizacao",
+        ]:
             logger.info("XLSX %s %s: %s", year, field, data.get(field))
     if raw_by_year:
         logger.info("Anos gerados: %s", sorted(raw_by_year.keys()))
+    if not any(data.get("qtd_acoes_total") for data in raw_by_year.values()):
+        logger.warning("qtd_acoes_total ausente (não foi possível derivar shares_outstanding)")
 
     critical_values = [
         data.get(field)
