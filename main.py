@@ -195,6 +195,9 @@ def process_row(
             for download in downloads:
                 zip_path = download["zip_path"]
                 reference_date = download.get("reference_date")
+                reference_year = download.get("reference_year")
+                protocol_year = download.get("protocol_year")
+                num_protocolo = download.get("num_protocolo")
                 extracted = extract_zip(zip_path, extracted_dir)
                 excel_paths = copy_excels(extracted["xlsx_paths"], excel_dir)
                 pdfs = collect_pdfs(extracted["extracted"], pdf_dir)
@@ -212,29 +215,39 @@ def process_row(
                     logger.info(
                         "XLSX encontrado para %s: %s", os.path.basename(zip_path), excel_paths[0]
                     )
-                    if reference_date:
-                        reference_year = int(reference_date.split("/")[-1])
+                    if reference_year:
                         xlsx_raw_by_year, xlsx_currency_unit = parse_xlsx(
                             excel_paths[0],
                             reference_year,
                             prefer_consolidated=True,
                         )
-                        if xlsx_currency_unit == "BRL_THOUSANDS":
-                            currency_unit = xlsx_currency_unit
-                        for year, parsed in xlsx_raw_by_year.items():
-                            raw_data = merge_raw_data(raw_data, parsed)
-                            if parsed.get("receita_liquida") is not None:
-                                historical["receita_liquida"][str(year)] = parsed["receita_liquida"]
-                            if parsed.get("lucro_liquido") is not None:
-                                historical["lucro_liquido"][str(year)] = parsed["lucro_liquido"]
-                            raw_by_year.setdefault(year, {})
-                            raw_by_year[year] = merge_raw_data(raw_by_year[year], parsed)
-                        if xlsx_raw_by_year:
-                            used_xlsx = True
+                    elif protocol_year:
+                        logger.warning(
+                            "Reference date ausente, usando ano do protocolo %s", num_protocolo
+                        )
+                        xlsx_raw_by_year, xlsx_currency_unit = parse_xlsx(
+                            excel_paths[0],
+                            protocol_year,
+                            prefer_consolidated=True,
+                        )
                     else:
                         result["errors"].append(
                             f"Referencia ausente para XLSX em {os.path.basename(zip_path)}"
                         )
+                        xlsx_raw_by_year = {}
+                        xlsx_currency_unit = "BRL"
+                    if xlsx_currency_unit == "BRL_THOUSANDS":
+                        currency_unit = xlsx_currency_unit
+                    for year, parsed in xlsx_raw_by_year.items():
+                        raw_data = merge_raw_data(raw_data, parsed)
+                        if parsed.get("receita_liquida") is not None:
+                            historical["receita_liquida"][str(year)] = parsed["receita_liquida"]
+                        if parsed.get("lucro_liquido") is not None:
+                            historical["lucro_liquido"][str(year)] = parsed["lucro_liquido"]
+                        raw_by_year.setdefault(year, {})
+                        raw_by_year[year] = merge_raw_data(raw_by_year[year], parsed)
+                    if xlsx_raw_by_year:
+                        used_xlsx = True
 
             if not used_xlsx:
                 for pdf_path in os.listdir(pdf_dir):

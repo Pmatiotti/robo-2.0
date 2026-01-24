@@ -59,10 +59,23 @@ def _parse_precision(value: Optional[str]) -> int:
 def _parse_number(value: Optional[float]) -> Optional[float]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
+    text = str(value).strip()
+    if text in {"", "-", "nan", "NaN"}:
+        return None
+    negative = text.startswith("(") and text.endswith(")")
+    text = text.strip("()").replace(" ", "")
+    if "," in text:
+        text = text.replace(".", "").replace(",", ".")
+    else:
+        text = text.replace(".", "")
+    text = re.sub(r"[^0-9\.\-]", "", text)
+    if text in {"", "-"}:
+        return None
     try:
-        return float(value)
+        parsed = float(text)
     except (TypeError, ValueError):
         return None
+    return -parsed if negative else parsed
 
 
 def _match_field(code: Optional[str], description: Optional[str]) -> Optional[str]:
@@ -109,6 +122,7 @@ def parse_xlsx(
         if sheet_names:
             break
 
+    used_sheets = []
     for sheet_name in sheet_names:
         df = _normalize_columns(sheets[sheet_name])
         code_col = _get_column(df, "código conta", "codigo conta")
@@ -119,7 +133,9 @@ def parse_xlsx(
         precision_col = _get_column(df, "precisao", "precisão")
         if not (last_col and prev_col and prev2_col):
             continue
+        used_sheets.append(sheet_name)
 
+        sample_matches = []
         for _, row in df.iterrows():
             field = _match_field(row.get(code_col), row.get(desc_col))
             if not field:
@@ -139,5 +155,37 @@ def parse_xlsx(
                 raw_by_year.setdefault(year, {})
                 if raw_by_year[year].get(field) is None:
                     raw_by_year[year][field] = value * multiplier
+                    if field in {"ativo_total", "passivo_total", "patrimonio_liquido", "receita_liquida", "lucro_liquido"}:
+                        sample_matches.append((field, year, raw_by_year[year][field]))
+
+        if sample_matches:
+            logger.info("Sheet %s: amostras %s", sheet_name, sample_matches[:5])
+
+    for year, data in raw_by_year.items():
+        filled = {key: value for key, value in data.items() if value is not None}
+        logger.info("XLSX campos preenchidos %s: %s", year, ", ".join(sorted(filled.keys())))
+        for field in ["ativo_total", "passivo_total", "patrimonio_liquido", "receita_liquida", "lucro_liquido"]:
+            logger.info("XLSX %s %s: %s", year, field, data.get(field))
+
+    critical_values = [
+        data.get(field)
+        for data in raw_by_year.values()
+        for field in ["ativo_total", "passivo_total", "patrimonio_liquido", "receita_liquida", "lucro_liquido"]
+    ]
+    if not critical_values or all(value in {None, 0} for value in critical_values):
+        logger.warning("Nenhum valor crítico encontrado no XLSX.")
+        logger.warning("Sheets avaliadas: %s", used_sheets)
+        if used_sheets:
+            df_sample = _normalize_columns(sheets[used_sheets[0]])
+            logger.warning(
+                "Colunas detectadas: code=%s desc=%s last=%s prev=%s prev2=%s precision=%s",
+                _get_column(df_sample, "código conta", "codigo conta"),
+                _get_column(df_sample, "descrição conta", "descricao conta"),
+                _get_column(df_sample, "valor ultimo exercicio", "valor último exercicio"),
+                _get_column(df_sample, "valor penultimo exercicio", "valor penúltimo exercicio"),
+                _get_column(df_sample, "valor antepenultimo exercicio", "valor antepenúltimo exercicio"),
+                _get_column(df_sample, "precisao", "precisão"),
+            )
+            logger.warning("Amostra linhas: %s", df_sample.head(3).to_dict(orient="records"))
 
     return raw_by_year, currency_unit

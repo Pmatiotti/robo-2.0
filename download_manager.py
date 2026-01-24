@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 DOWNLOAD_ICON_SELECTOR = "i.fi-download[title='Download']"
 DATE_RE = re.compile(r"\b\d{2}/\d{2}/\d{4}\b")
 ONCLICK_RE = re.compile(r"OpenDownloadDocumentos\((.*?)\)")
+PROTOCOLO_YEAR_RE = re.compile(r"DFP31?12?(\d{4})")
+REFERENCE_DATE_RE = re.compile(r"\b31/12/\d{4}\b")
 
 
 def _build_zip_name(ticker: str, codigo_cvm: str, index: int) -> str:
@@ -51,6 +53,19 @@ def _parse_onclick_to_url(onclick_str: str) -> Optional[Tuple[str, str]]:
     }
     url = f"https://www.rad.cvm.gov.br/ENET/frmDownloadDocumento.aspx?{urlencode(params)}"
     return url, "GET"
+
+
+def _extract_onclick_metadata(onclick_str: Optional[str]) -> Dict[str, Optional[str]]:
+    match = ONCLICK_RE.search(onclick_str or "")
+    if not match:
+        return {"num_protocolo": None, "reference_year": None}
+    args = re.findall(r"'(.*?)'", match.group(1))
+    if len(args) < 4:
+        return {"num_protocolo": None, "reference_year": None}
+    num_protocolo = args[2]
+    year_match = PROTOCOLO_YEAR_RE.search(num_protocolo)
+    reference_year = year_match.group(1) if year_match else None
+    return {"num_protocolo": num_protocolo, "reference_year": reference_year}
 
 
 def _download_http(page: Page, url: str, path: str) -> None:
@@ -178,13 +193,29 @@ def download_documents(
         dest_path = os.path.join(downloads_dir, filename)
         reference_date = None
         for cell in cells:
-            match = DATE_RE.search(cell)
+            match = REFERENCE_DATE_RE.search(cell)
             if match:
                 reference_date = match.group(0)
                 break
+        if reference_date is None:
+            for cell in cells:
+                match = DATE_RE.search(cell)
+                if match:
+                    reference_date = match.group(0)
+                    break
         logger.info("Baixando %s", filename)
         _download_single(page, icon.first, dest_path, retries)
-        downloads.append({"zip_path": dest_path, "reference_date": reference_date})
+        onclick = icon.locator("xpath=ancestor::*[@onclick][1]").get_attribute("onclick")
+        metadata = _extract_onclick_metadata(onclick)
+        downloads.append(
+            {
+                "zip_path": dest_path,
+                "reference_date": reference_date,
+                "reference_year": int(reference_date.split("/")[-1]) if reference_date else None,
+                "num_protocolo": metadata["num_protocolo"],
+                "protocol_year": int(metadata["reference_year"]) if metadata["reference_year"] else None,
+            }
+        )
 
     logger.info("Documentos ativos: %s | ignorados por status: %s", active_count, inactive_count)
     if active_count == 0:
