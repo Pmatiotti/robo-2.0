@@ -64,11 +64,8 @@ class CvmFlow:
                 )
                 self._wait_for_overlay()
                 selected = self.page.evaluate(
-                    """
-                    const el = document.querySelector('#cboCategorias');
-                    if (!el) return '';
-                    return el.options[el.selectedIndex]?.text || '';
-                    """
+                    "() => { const el = document.querySelector('#cboCategorias'); "
+                    "return el ? (el.options[el.selectedIndex]?.text || '') : ''; }"
                 )
                 if selected and "DFP" in selected.upper():
                     logger.info("Categoria DFP selecionada via native_select")
@@ -91,11 +88,8 @@ class CvmFlow:
         option.first.click()
         self._wait_for_overlay()
         selected = self.page.evaluate(
-            """
-            const el = document.querySelector('#cboCategorias');
-            if (!el) return '';
-            return el.options[el.selectedIndex]?.text || '';
-            """
+            "() => { const el = document.querySelector('#cboCategorias'); "
+            "return el ? (el.options[el.selectedIndex]?.text || '') : ''; }"
         )
         if selected and "DFP" in selected.upper():
             logger.info("Categoria DFP selecionada via chosen")
