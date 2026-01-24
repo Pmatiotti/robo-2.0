@@ -17,9 +17,15 @@ class CvmFlow:
         if overlay.count() == 0:
             return
         try:
-            overlay.wait_for(state="hidden", timeout=10000)
+            overlay.wait_for(state="hidden", timeout=20000)
         except Exception:
-            logger.debug("Overlay ainda visível, tentando continuar")
+            logger.debug("Overlay ainda visível, tentando remover via script")
+            try:
+                self.page.evaluate(
+                    "document.querySelectorAll('.ui-widget-overlay.ui-front').forEach(el => el.remove());"
+                )
+            except Exception:
+                logger.debug("Não foi possível remover overlay via script")
 
     def open_enet(self, codigo_cvm: str) -> None:
         url = f"{RAD_ENET_URL}?tipoconsulta=CVM&codigoCVM={codigo_cvm}"
