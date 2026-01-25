@@ -145,78 +145,67 @@ def _infer_base_year_from_df(df: pd.DataFrame) -> Optional[int]:
 
 def infer_workbook_base_year(
     sheets: Dict[str, pd.DataFrame],
-    reference_year: Optional[int],
-) -> Tuple[Optional[int], str]:
-    capital_sheets = []
+) -> Optional[int]:
     for name, df in sheets.items():
         normalized = _normalize_sheet_name(name)
-        if "composicaocapital" in normalized:
-            capital_sheets.append(df)
-    for df in capital_sheets:
+        if "composicaocapital" not in normalized:
+            continue
         df_norm = _normalize_columns(df)
         year = _infer_base_year_from_df(df_norm)
         if year:
-            return year, "xlsx:composicao_capital"
-
-    for df in sheets.values():
-        df_norm = _normalize_columns(df)
-        year = _infer_base_year_from_df(df_norm)
-        if year:
-            return year, "xlsx:generic_date_col"
-
-    if reference_year:
-        return reference_year, "enet:reference_year"
-    return None, "none"
+            return year
+        for _, row in df_norm.dropna(how="all").head(3).iterrows():
+            for value in row.values:
+                year = _parse_date_to_year(value)
+                if year:
+                    return year
+    return None
 
 
-def _infer_base_year_from_sheet(
-    df: pd.DataFrame,
-    sheet_norm_name: str,
-    reference_year: Optional[int],
-) -> Tuple[Optional[int], bool]:
+def _infer_base_year_from_sheet(df: pd.DataFrame) -> Optional[int]:
     inferred_year = _infer_base_year_from_df(df)
     if inferred_year:
-        return inferred_year, False
+        return inferred_year
     for _, row in df.dropna(how="all").head(3).iterrows():
         for value in row.values:
             year = _parse_date_to_year(value)
             if year:
-                return year, False
-    return reference_year, True
+                return year
+    return None
 
 
 def _populate_share_counts(
     raw_by_year: Dict[int, Dict[str, Optional[float]]],
     df: pd.DataFrame,
+    base_year: int,
 ) -> None:
-    ultimo_col = _get_column_by_tokens(df, "ultimo", "exercicio")
     issued_col = _get_column_by_tokens(df, "total", "capital", "integralizado")
     treasury_col = _get_column_by_tokens(df, "total", "tesouraria")
     precision_col = _get_column_by_tokens(df, "precisao") or _get_column_by_tokens(df, "unidade")
-    if not (ultimo_col and issued_col):
+    if not issued_col:
         return
     multiplier = _parse_precision(df.get(precision_col).iloc[0] if precision_col else None)
-    for _, row in df.iterrows():
-        year = _parse_date_to_year(row.get(ultimo_col))
-        if year is None:
-            continue
-        shares_issued = _parse_number(row.get(issued_col))
-        shares_treasury = _parse_number(row.get(treasury_col)) if treasury_col else None
-        if shares_issued is None:
-            continue
-        shares_issued *= multiplier
-        if shares_treasury is not None:
-            shares_treasury *= multiplier
-        shares_outstanding = None
-        if shares_treasury is not None and shares_issued >= shares_treasury:
-            shares_outstanding = shares_issued - shares_treasury
-        raw_by_year.setdefault(year, {})
-        if shares_outstanding is not None and raw_by_year[year].get("qtd_acoes_total") is None:
-            raw_by_year[year]["qtd_acoes_total"] = shares_outstanding
-        if raw_by_year[year].get("qtd_acoes_emitidas") is None:
-            raw_by_year[year]["qtd_acoes_emitidas"] = shares_issued
-        if shares_treasury is not None and raw_by_year[year].get("qtd_acoes_tesouraria") is None:
-            raw_by_year[year]["qtd_acoes_tesouraria"] = shares_treasury
+    first_row = df.dropna(how="all").head(1)
+    if first_row.empty:
+        return
+    row = first_row.iloc[0]
+    shares_issued = _parse_number(row.get(issued_col))
+    shares_treasury = _parse_number(row.get(treasury_col)) if treasury_col else None
+    if shares_issued is None:
+        return
+    shares_issued *= multiplier
+    if shares_treasury is not None:
+        shares_treasury *= multiplier
+    shares_outstanding = None
+    if shares_treasury is not None and shares_issued >= shares_treasury:
+        shares_outstanding = shares_issued - shares_treasury
+    raw_by_year.setdefault(base_year, {})
+    if shares_outstanding is not None and raw_by_year[base_year].get("qtd_acoes_total") is None:
+        raw_by_year[base_year]["qtd_acoes_total"] = shares_outstanding
+    if raw_by_year[base_year].get("qtd_acoes_emitidas") is None:
+        raw_by_year[base_year]["qtd_acoes_emitidas"] = shares_issued
+    if shares_treasury is not None and raw_by_year[base_year].get("qtd_acoes_tesouraria") is None:
+        raw_by_year[base_year]["qtd_acoes_tesouraria"] = shares_treasury
 
 
 def _match_field(code: Optional[str], description: Optional[str]) -> Optional[str]:
@@ -259,35 +248,36 @@ def parse_xlsx(
     sheet_names = preferred or fallback
     logger.info("Sheets usadas: %s", sheet_names)
 
-    workbook_base_year, base_source = infer_workbook_base_year(sheets, reference_year)
+    workbook_base_year = infer_workbook_base_year(sheets)
     if workbook_base_year is None:
-        logger.warning("Reference year não encontrado no XLSX.")
+        workbook_base_year = reference_year
+        if workbook_base_year:
+            logger.info("workbook_base_year=%s source=enet:reference_year", workbook_base_year)
+        else:
+            logger.warning("workbook_base_year não encontrado (sem fallback)")
     else:
-        logger.info("Base year workbook=%s source=%s", workbook_base_year, base_source)
+        logger.info("workbook_base_year=%s source=composicao_capital", workbook_base_year)
+
     if workbook_base_year:
         logger.info(
-            "Anos gerados (base workbook): %s",
+            "anos permitidos: %s",
             [workbook_base_year, workbook_base_year - 1, workbook_base_year - 2],
         )
 
     for name, normalized in normalized_sheets.items():
-        if "composicaocapital" in normalized:
+        if "composicaocapital" in normalized and workbook_base_year:
             df_capital = _normalize_columns(sheets[name])
-            _populate_share_counts(raw_by_year, df_capital)
+            _populate_share_counts(raw_by_year, df_capital, workbook_base_year)
 
     used_sheets = []
     for sheet_name in sheet_names:
         df = _normalize_columns(sheets[sheet_name])
-        base_year, fallback_used = _infer_base_year_from_sheet(df, normalized_sheets[sheet_name], reference_year)
-        current_year = datetime.utcnow().year
-        if base_year and (base_year > current_year + 1 or base_year < 1990):
-            base_year = reference_year
-            fallback_used = True
+        base_year = _infer_base_year_from_sheet(df) or workbook_base_year
         logger.info(
             "Sheet %s base_year=%s fallback_used=%s inferred_sheet_year=%s",
             sheet_name,
             base_year,
-            fallback_used,
+            base_year != _infer_base_year_from_sheet(df),
             _infer_base_year_from_df(df),
         )
         code_col = _get_column_by_tokens(df, "codigo")
@@ -323,13 +313,15 @@ def parse_xlsx(
             if multiplier == 1000:
                 currency_unit = "BRL_THOUSANDS"
 
+            if base_year is None:
+                continue
             values = {
-                base_year: _parse_number(row.get(last_col)) if base_year else None,
-                (base_year - 1) if base_year else None: _parse_number(row.get(prev_col)),
-                (base_year - 2) if base_year else None: _parse_number(row.get(prev2_col)),
+                base_year: _parse_number(row.get(last_col)),
+                base_year - 1: _parse_number(row.get(prev_col)),
+                base_year - 2: _parse_number(row.get(prev2_col)),
             }
             for year, value in values.items():
-                if value is None or year is None:
+                if value is None:
                     continue
                 raw_by_year.setdefault(year, {})
                 if raw_by_year[year].get(field) is None:
