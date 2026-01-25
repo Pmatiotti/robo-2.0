@@ -250,13 +250,9 @@ def parse_xlsx(
 
     workbook_base_year = infer_workbook_base_year(sheets)
     if workbook_base_year is None:
-        workbook_base_year = reference_year
-        if workbook_base_year:
-            logger.info("workbook_base_year=%s source=enet:reference_year", workbook_base_year)
-        else:
-            logger.warning("workbook_base_year não encontrado (sem fallback)")
-    else:
-        logger.info("workbook_base_year=%s source=composicao_capital", workbook_base_year)
+        logger.warning("workbook_base_year não encontrado (sem fallback)")
+        return {}, currency_unit
+    logger.info("workbook_base_year=%s source=composicao_capital", workbook_base_year)
 
     if workbook_base_year:
         logger.info(
@@ -265,20 +261,21 @@ def parse_xlsx(
         )
 
     for name, normalized in normalized_sheets.items():
-        if "composicaocapital" in normalized and workbook_base_year:
+        if "composicaocapital" in normalized:
             df_capital = _normalize_columns(sheets[name])
             _populate_share_counts(raw_by_year, df_capital, workbook_base_year)
 
     used_sheets = []
     for sheet_name in sheet_names:
         df = _normalize_columns(sheets[sheet_name])
-        base_year = _infer_base_year_from_sheet(df) or workbook_base_year
+        base_year = workbook_base_year
+        inferred_sheet_year = _infer_base_year_from_df(df)
         logger.info(
             "Sheet %s base_year=%s fallback_used=%s inferred_sheet_year=%s",
             sheet_name,
             base_year,
-            base_year != _infer_base_year_from_sheet(df),
-            _infer_base_year_from_df(df),
+            False,
+            inferred_sheet_year,
         )
         code_col = _get_column_by_tokens(df, "codigo")
         desc_col = _get_column_by_tokens(df, "descricao")
@@ -305,8 +302,10 @@ def parse_xlsx(
             field = _match_field(row.get(code_col), row.get(desc_col))
             if not field:
                 desc_text = str(row.get(desc_col) or "").lower()
-                if "deprecia" in desc_text and "amort" in desc_text:
+                if "deprecia" in desc_text:
                     field = "depreciacao"
+                elif "amortiza" in desc_text:
+                    field = "amortizacao"
                 else:
                     continue
             multiplier = _parse_precision(row.get(precision_col))
@@ -315,26 +314,26 @@ def parse_xlsx(
 
             if base_year is None:
                 continue
+            allowed_years = {base_year, base_year - 1, base_year - 2}
             values = {
                 base_year: _parse_number(row.get(last_col)),
                 base_year - 1: _parse_number(row.get(prev_col)),
                 base_year - 2: _parse_number(row.get(prev2_col)),
             }
             for year, value in values.items():
-                if value is None:
+                if value is None or year not in allowed_years:
                     continue
                 raw_by_year.setdefault(year, {})
                 if raw_by_year[year].get(field) is None:
                     raw_by_year[year][field] = value * multiplier
-                    if field == "depreciacao" and raw_by_year[year].get("amortizacao") is None:
-                        raw_by_year[year]["amortizacao"] = 0.0
-                        logger.info("D&A encontrado em %s (%s): %s", sheet_name, field, raw_by_year[year][field])
                     if field in {"ativo_total", "passivo_total", "patrimonio_liquido", "receita_liquida", "lucro_liquido"}:
                         sample_matches.append((field, year, raw_by_year[year][field]))
 
         if sample_matches:
             logger.info("Sheet %s: amostras %s", sheet_name, sample_matches[:5])
 
+    allowed_years = {workbook_base_year, workbook_base_year - 1, workbook_base_year - 2}
+    raw_by_year = {year: data for year, data in raw_by_year.items() if year in allowed_years}
     for year, data in raw_by_year.items():
         filled = {key: value for key, value in data.items() if value is not None}
         logger.info("XLSX campos preenchidos %s: %s", year, ", ".join(sorted(filled.keys())))
