@@ -61,6 +61,34 @@ def merge_raw_data(base: Dict[str, Optional[float]], new: Dict[str, Optional[flo
     return merged
 
 
+def parse_reference_date(value: Optional[str]) -> datetime:
+    if not value:
+        return datetime.min
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y%m%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    logger.warning("Formato de reference_date desconhecido: %s", value)
+    return datetime.min
+
+
+def consolidate_documents(documents: List[Dict[str, Any]]) -> Dict[int, Dict[str, Optional[float]]]:
+    consolidated: Dict[int, Dict[str, Optional[float]]] = {}
+    selected_reference: Dict[int, datetime] = {}
+
+    for document in documents:
+        reference_dt = document["reference_datetime"]
+        raw_by_year = document["raw_by_year"]
+        for year, raw in raw_by_year.items():
+            current_dt = selected_reference.get(year, datetime.min)
+            if reference_dt > current_dt:
+                consolidated[year] = raw
+                selected_reference[year] = reference_dt
+
+    return consolidated
+
+
 def collect_pdfs(extracted_paths: List[str], pdf_dir: str) -> List[str]:
     ensure_dir(pdf_dir)
     pdfs: List[str] = []
@@ -142,7 +170,7 @@ def process_row(
     enterprise_value = parse_decimal(row.get("enterprise_value"))
     dividendos_12m = parse_decimal(row.get("dividendos_12m"))
 
-    raw_data: Dict[str, Optional[float]] = {
+    raw_data_template: Dict[str, Optional[float]] = {
         "ativo_total": None,
         "passivo_total": None,
         "patrimonio_liquido": None,
@@ -163,14 +191,12 @@ def process_row(
         "dividendos": None,
     }
 
-    raw_by_year: Dict[int, Dict[str, Optional[float]]] = {}
     currency_unit = "BRL"
-    historical = {"receita_liquida": {}, "lucro_liquido": {}}
     ultimo_dividendo = None
     data_ultimo_dividendo = None
     has_parsing_errors = False
-    used_xlsx = False
     is_financial, financial_type = get_financial_profile(ticker)
+    documents_data: List[Dict[str, Any]] = []
 
     if not cod_cvm:
         message = "Código CVM ausente no CSV"
@@ -214,6 +240,9 @@ def process_row(
                         "reference_date": reference_date,
                     }
                 )
+                doc_raw_data = dict(raw_data_template)
+                doc_raw_by_year: Dict[int, Dict[str, Optional[float]]] = {}
+                doc_used_xlsx = False
                 if excel_paths:
                     logger.info(
                         "XLSX encontrado para %s: %s", os.path.basename(zip_path), excel_paths[0]
@@ -246,56 +275,81 @@ def process_row(
                     if xlsx_currency_unit == "BRL_THOUSANDS":
                         currency_unit = xlsx_currency_unit
                     for year, parsed in xlsx_raw_by_year.items():
-                        raw_data = merge_raw_data(raw_data, parsed)
-                        if parsed.get("receita_liquida") is not None:
-                            historical["receita_liquida"][str(year)] = parsed["receita_liquida"]
-                        if parsed.get("lucro_liquido") is not None:
-                            historical["lucro_liquido"][str(year)] = parsed["lucro_liquido"]
-                        raw_by_year.setdefault(year, {})
-                        raw_by_year[year] = merge_raw_data(raw_by_year[year], parsed)
+                        doc_raw_data = merge_raw_data(doc_raw_data, parsed)
+                        doc_raw_by_year.setdefault(year, {})
+                        doc_raw_by_year[year] = merge_raw_data(doc_raw_by_year[year], parsed)
                     if xlsx_raw_by_year:
-                        used_xlsx = True
+                        doc_used_xlsx = True
 
-            if not used_xlsx:
-                for pdf_path in os.listdir(pdf_dir):
-                    full_path = os.path.join(pdf_dir, pdf_path)
-                    if not pdf_path.lower().endswith(".pdf"):
-                        continue
-                    try:
-                        parsed_by_year, unit, dividend_value, dividend_date = parse_dfp_pdf(
-                            full_path,
-                            {
-                                "output_root": output_root,
-                                "ticker": ticker,
-                                "codigo_cvm": cod_cvm,
-                            },
-                        )
-                        if unit == "BRL_THOUSANDS":
-                            currency_unit = unit
-                        for year, parsed in parsed_by_year.items():
-                            raw_data = merge_raw_data(raw_data, parsed)
-                            if parsed.get("receita_liquida") is not None:
-                                historical["receita_liquida"][str(year)] = parsed["receita_liquida"]
-                            if parsed.get("lucro_liquido") is not None:
-                                historical["lucro_liquido"][str(year)] = parsed["lucro_liquido"]
-                            if year not in raw_by_year:
-                                raw_by_year[year] = {}
-                            raw_by_year[year] = merge_raw_data(raw_by_year[year], parsed)
-                        if ultimo_dividendo is None and dividend_value is not None:
-                            ultimo_dividendo = dividend_value
-                        if data_ultimo_dividendo is None and dividend_date is not None:
-                            data_ultimo_dividendo = dividend_date
-                    except Exception as exc:
-                        has_parsing_errors = True
-                        result["errors"].append(f"Erro parse PDF {pdf_path}: {exc}")
+                if not doc_used_xlsx:
+                    for pdf_path in pdfs:
+                        full_path = os.path.join(pdf_dir, os.path.basename(pdf_path))
+                        try:
+                            parsed_by_year, unit, dividend_value, dividend_date = parse_dfp_pdf(
+                                full_path,
+                                {
+                                    "output_root": output_root,
+                                    "ticker": ticker,
+                                    "codigo_cvm": cod_cvm,
+                                },
+                            )
+                            if unit == "BRL_THOUSANDS":
+                                currency_unit = unit
+                            for year, parsed in parsed_by_year.items():
+                                doc_raw_data = merge_raw_data(doc_raw_data, parsed)
+                                doc_raw_by_year.setdefault(year, {})
+                                doc_raw_by_year[year] = merge_raw_data(doc_raw_by_year[year], parsed)
+                            if ultimo_dividendo is None and dividend_value is not None:
+                                ultimo_dividendo = dividend_value
+                            if data_ultimo_dividendo is None and dividend_date is not None:
+                                data_ultimo_dividendo = dividend_date
+                        except Exception as exc:
+                            has_parsing_errors = True
+                            result["errors"].append(f"Erro parse PDF {os.path.basename(pdf_path)}: {exc}")
+
+                reference_dt = parse_reference_date(reference_date)
+                years_covered = sorted(doc_raw_by_year.keys())
+                document_entry = {
+                    "filename": os.path.basename(zip_path),
+                    "sha256": sha,
+                    "size_bytes": os.path.getsize(zip_path),
+                    "pdfs_extracted": len(pdfs),
+                    "reference_date": reference_date,
+                    "base_year": reference_year or protocol_year,
+                    "years_covered": years_covered,
+                    "raw_by_year": doc_raw_by_year,
+                }
+                result["documents"][-1].update(document_entry)
+                documents_data.append(
+                    {
+                        "reference_date": reference_date,
+                        "reference_datetime": reference_dt,
+                        "base_year": reference_year or protocol_year,
+                        "years_covered": years_covered,
+                        "raw_by_year": doc_raw_by_year,
+                    }
+                )
 
             browser.close()
+
+        consolidated_raw_by_year = consolidate_documents(documents_data)
+        raw_data = dict(raw_data_template)
+        historical = {"receita_liquida": {}, "lucro_liquido": {}}
+        for year in sorted(consolidated_raw_by_year.keys()):
+            parsed = consolidated_raw_by_year[year]
+            raw_data = merge_raw_data(raw_data, parsed)
+            if parsed.get("receita_liquida") is not None:
+                historical["receita_liquida"][str(year)] = parsed["receita_liquida"]
+            if parsed.get("lucro_liquido") is not None:
+                historical["lucro_liquido"][str(year)] = parsed["lucro_liquido"]
 
         result["raw_extracted"] = raw_data
         result["currency_unit"] = currency_unit
         result["historical"] = historical
-        result["normalized_financials"] = {str(year): data for year, data in raw_by_year.items()}
-        result["raw_by_year"] = raw_by_year
+        result["normalized_financials"] = {
+            str(year): data for year, data in consolidated_raw_by_year.items()
+        }
+        result["raw_by_year"] = consolidated_raw_by_year
 
         receita_series = {int(year): value for year, value in historical["receita_liquida"].items()}
         lucro_series = {int(year): value for year, value in historical["lucro_liquido"].items()}
@@ -313,7 +367,7 @@ def process_row(
             "dividendos_12m": dividendos_12m,
         }
         indicators_by_year, missing_by_indicator_by_year, missing_inputs_by_year, calc_trace_by_year = (
-            calculate_indicators_by_year(raw_by_year, market_data)
+            calculate_indicators_by_year(consolidated_raw_by_year, market_data)
         )
 
         raw_indicators_by_year: Dict[int, Dict[str, Optional[float]]] = {}
