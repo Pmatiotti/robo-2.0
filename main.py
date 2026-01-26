@@ -13,7 +13,9 @@ from playwright.sync_api import sync_playwright
 from cvm_flow import CvmFlow
 from download_manager import download_documents
 from indicators import calculate_indicators_by_year
+from financial_universe import get_financial_profile
 from moniitor_client import MoniitorClient
+from normalization import normalize_indicators
 from pdf_parser_dfp import parse_dfp_pdf
 from xlsx_parser_dfp import parse_xlsx
 from utils import (
@@ -168,6 +170,7 @@ def process_row(
     data_ultimo_dividendo = None
     has_parsing_errors = False
     used_xlsx = False
+    is_financial, financial_type = get_financial_profile(ticker)
 
     if not cod_cvm:
         message = "Código CVM ausente no CSV"
@@ -313,6 +316,11 @@ def process_row(
             calculate_indicators_by_year(raw_by_year, market_data)
         )
 
+        raw_indicators_by_year: Dict[int, Dict[str, Optional[float]]] = {}
+        normalized_indicators_by_year: Dict[int, Dict[str, Optional[float]]] = {}
+        conversions_total = 0
+        anomalies_total = 0
+
         for year, indicators in indicators_by_year.items():
             indicators["cagr_receitas_5"] = cagr_receitas_5
             indicators["cagr_lucros_5"] = cagr_lucros_5
@@ -325,15 +333,27 @@ def process_row(
                 missing_inputs_by_year[year].append("historical_receita_liquida")
             if cagr_lucros_5 is None and "historical_lucro_liquido" not in missing_inputs_by_year[year]:
                 missing_inputs_by_year[year].append("historical_lucro_liquido")
+            raw_indicators_by_year[year] = dict(indicators)
+            normalized, conversions, anomalies = normalize_indicators(
+                indicators,
+                is_financial,
+                ticker,
+                year,
+            )
+            normalized_indicators_by_year[year] = normalized
+            conversions_total += conversions
+            anomalies_total += anomalies
 
         payloads = []
         liquidez_media_diaria = parse_decimal(row.get("liquidez_media_diaria"))
-        for year, indicators in indicators_by_year.items():
+        for year, indicators in normalized_indicators_by_year.items():
             payload = {
                 "ticker": ticker,
                 "asset_class": asset_class,
                 "data_source": "cvm_dfp_bot",
                 "fiscal_year": year,
+                "is_financial": is_financial,
+                "financial_type": financial_type,
                 "current_price": current_price,
                 "market_cap": market_cap,
                 "enterprise_value": enterprise_value,
@@ -346,7 +366,9 @@ def process_row(
                 payload["liquidez_media_diaria"] = liquidez_media_diaria
             payloads.append(payload)
         result["moniitor_payload"] = payloads
-        result["indicators"] = indicators_by_year
+        result["indicators"] = normalized_indicators_by_year
+        result["raw_indicators_by_year"] = raw_indicators_by_year
+        result["normalized_indicators_by_year"] = normalized_indicators_by_year
         result["calc_trace_by_year"] = calc_trace_by_year
         result["dividends"] = {
             "ultimo_dividendo": ultimo_dividendo,
@@ -358,6 +380,12 @@ def process_row(
         for missing_inputs in missing_inputs_by_year.values():
             aggregated_missing.update(missing_inputs)
         result["missing_inputs"] = list(aggregated_missing)
+        logger.info(
+            "Normalizações: %s convertidos | %s anomalias | financeiros=%s",
+            conversions_total,
+            anomalies_total,
+            int(is_financial),
+        )
 
         try:
             client = MoniitorClient()
