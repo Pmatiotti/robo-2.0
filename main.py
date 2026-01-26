@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headless", default="true", help="true/false")
     parser.add_argument("--timeout-ms", type=int, default=60000)
     parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--dry-run", default="false", help="true/false")
     return parser.parse_args()
 
 
@@ -76,15 +77,19 @@ def parse_reference_date(value: Optional[str]) -> datetime:
 def consolidate_documents(documents: List[Dict[str, Any]]) -> Dict[int, Dict[str, Optional[float]]]:
     consolidated: Dict[int, Dict[str, Optional[float]]] = {}
     selected_reference: Dict[int, datetime] = {}
+    selected_version: Dict[int, int] = {}
 
     for document in documents:
         reference_dt = document["reference_datetime"]
         raw_by_year = document["raw_by_year"]
+        num_versao = document.get("num_versao", 0) or 0
         for year, raw in raw_by_year.items():
             current_dt = selected_reference.get(year, datetime.min)
-            if reference_dt > current_dt:
+            current_version = selected_version.get(year, 0)
+            if reference_dt > current_dt or (reference_dt == current_dt and num_versao > current_version):
                 consolidated[year] = raw
                 selected_reference[year] = reference_dt
+                selected_version[year] = num_versao
 
     return consolidated
 
@@ -93,8 +98,23 @@ def build_absolute_payload(
     normalized_financials: Dict[int, Dict[str, Optional[float]]],
     ticker: str,
     year: int,
+    is_financial: bool,
 ) -> Dict[str, Optional[float]]:
     data = normalized_financials.get(year, {})
+    qtd_emitidas = data.get("qtd_acoes_emitidas")
+    qtd_tesouraria = data.get("qtd_acoes_tesouraria")
+    qtd_total = data.get("qtd_acoes_total")
+    if qtd_emitidas is None and qtd_total is not None:
+        qtd_emitidas = qtd_total
+    if qtd_total is None and qtd_emitidas is not None and qtd_tesouraria is not None:
+        qtd_total = qtd_emitidas - qtd_tesouraria
+    ebitda = None
+    if not is_financial:
+        ebit = data.get("ebit")
+        depreciacao = data.get("depreciacao")
+        amortizacao = data.get("amortizacao")
+        if ebit is not None and depreciacao is not None and amortizacao is not None:
+            ebitda = ebit + depreciacao + amortizacao
     absolute_fields = {
         "receita_liquida": data.get("receita_liquida"),
         "lucro_liquido": data.get("lucro_liquido"),
@@ -103,8 +123,20 @@ def build_absolute_payload(
         "emprestimos_cp": data.get("emprestimos_cp"),
         "emprestimos_lp": data.get("emprestimos_lp"),
         "ebit": data.get("ebit"),
+        "depreciacao": data.get("depreciacao"),
+        "amortizacao": data.get("amortizacao"),
+        "ebitda": ebitda,
         "ativo_total": data.get("ativo_total"),
         "patrimonio_liquido": data.get("patrimonio_liquido"),
+        "qtd_acoes_emitidas": qtd_emitidas,
+        "qtd_acoes_tesouraria": qtd_tesouraria,
+        "qtd_acoes_total": qtd_total,
+        "revenue": data.get("receita_liquida"),
+        "net_income": data.get("lucro_liquido"),
+        "gross_profit": data.get("lucro_bruto"),
+        "cash_and_equivalents": data.get("caixa"),
+        "total_assets": data.get("ativo_total"),
+        "total_equity": data.get("patrimonio_liquido"),
     }
     filled_keys = [key for key, value in absolute_fields.items() if value is not None]
     logger.info(
@@ -156,6 +188,7 @@ def process_row(
     headless: bool,
     timeout_ms: int,
     max_retries: int,
+    dry_run: bool,
 ) -> Dict[str, Any]:
     ticker = str(row["ticker"]).upper().strip()
     asset_class = str(row["asset_class"]).strip()
@@ -222,7 +255,14 @@ def process_row(
     ultimo_dividendo = None
     data_ultimo_dividendo = None
     has_parsing_errors = False
-    is_financial, financial_type = get_financial_profile(ticker)
+    csv_is_financial = None
+    if "is_financial" in row.index:
+        csv_is_financial = None if pd.isna(row.get("is_financial")) else parse_bool(row.get("is_financial"))
+    if csv_is_financial is None:
+        is_financial, financial_type = get_financial_profile(ticker)
+    else:
+        is_financial = csv_is_financial
+        financial_type = get_financial_profile(ticker)[1] if is_financial else None
     documents_data: List[Dict[str, Any]] = []
 
     if not cod_cvm:
@@ -254,6 +294,7 @@ def process_row(
                 reference_year = download.get("reference_year")
                 protocol_year = download.get("protocol_year")
                 num_protocolo = download.get("num_protocolo")
+                num_versao = download.get("num_versao") or 0
                 extracted = extract_zip(zip_path, extracted_dir)
                 excel_paths = copy_excels(extracted["xlsx_paths"], excel_dir)
                 pdfs = collect_pdfs(extracted["extracted"], pdf_dir)
@@ -343,6 +384,7 @@ def process_row(
                     "pdfs_extracted": len(pdfs),
                     "reference_date": reference_date,
                     "base_year": reference_year or protocol_year,
+                    "num_versao": num_versao,
                     "years_covered": years_covered,
                     "raw_by_year": doc_raw_by_year,
                 }
@@ -352,6 +394,7 @@ def process_row(
                         "reference_date": reference_date,
                         "reference_datetime": reference_dt,
                         "base_year": reference_year or protocol_year,
+                        "num_versao": num_versao,
                         "years_covered": years_covered,
                         "raw_by_year": doc_raw_by_year,
                     }
@@ -402,6 +445,8 @@ def process_row(
         normalized_indicators_by_year: Dict[int, Dict[str, Optional[float]]] = {}
         conversions_total = 0
         anomalies_total = 0
+        converted_fields: List[str] = []
+        anomaly_fields: List[str] = []
 
         for year, indicators in indicators_by_year.items():
             indicators["cagr_receitas_5"] = cagr_receitas_5
@@ -416,7 +461,7 @@ def process_row(
             if cagr_lucros_5 is None and "historical_lucro_liquido" not in missing_inputs_by_year[year]:
                 missing_inputs_by_year[year].append("historical_lucro_liquido")
             raw_indicators_by_year[year] = dict(indicators)
-            normalized, conversions, anomalies = normalize_indicators(
+            normalized, conversions, anomalies, converted_keys, anomaly_keys = normalize_indicators(
                 indicators,
                 is_financial,
                 ticker,
@@ -425,6 +470,8 @@ def process_row(
             normalized_indicators_by_year[year] = normalized
             conversions_total += conversions
             anomalies_total += anomalies
+            converted_fields.extend(converted_keys)
+            anomaly_fields.extend(anomaly_keys)
 
         payloads = []
         liquidez_media_diaria = parse_decimal(row.get("liquidez_media_diaria"))
@@ -433,6 +480,7 @@ def process_row(
                 normalized_financials_by_year,
                 ticker,
                 year,
+                is_financial,
             )
             payload = {
                 "ticker": ticker,
@@ -469,19 +517,25 @@ def process_row(
             aggregated_missing.update(missing_inputs)
         result["missing_inputs"] = list(aggregated_missing)
         logger.info(
-            "Normalizações: %s convertidos | %s anomalias | financeiros=%s",
+            "Normalizações: %s convertidos | %s anomalias | convertidos_ex=%s | anomalias_ex=%s | financeiros=%s",
             conversions_total,
             anomalies_total,
+            sorted(set(converted_fields))[:5],
+            sorted(set(anomaly_fields))[:5],
             int(is_financial),
         )
 
         try:
-            client = MoniitorClient()
-            if payloads:
-                response = client.send_batch(payloads)
+            if dry_run:
+                logger.info("Dry-run payload: %s", json.dumps({"data": payloads}, ensure_ascii=False))
+                result["moniitor_response"] = {"dry_run": True, "payload_size": len(payloads)}
             else:
-                response = {"error": "No fiscal year indicators to send"}
-            result["moniitor_response"] = response
+                client = MoniitorClient()
+                if payloads:
+                    response = client.send_batch(payloads)
+                else:
+                    response = {"error": "No fiscal year indicators to send"}
+                result["moniitor_response"] = response
         except ValueError as exc:
             result["errors"].append(str(exc))
         if result["errors"] or has_parsing_errors:
@@ -502,6 +556,7 @@ def main() -> None:
     setup_logging()
     df = load_input(args.input)
     headless = parse_bool(args.headless, default=True)
+    dry_run = parse_bool(args.dry_run, default=False)
 
     for _, row in df.iterrows():
         process_row(
@@ -511,6 +566,7 @@ def main() -> None:
             headless,
             args.timeout_ms,
             args.max_retries,
+            dry_run,
         )
 
 

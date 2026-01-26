@@ -58,14 +58,15 @@ def _parse_onclick_to_url(onclick_str: str) -> Optional[Tuple[str, str]]:
 def _extract_onclick_metadata(onclick_str: Optional[str]) -> Dict[str, Optional[str]]:
     match = ONCLICK_RE.search(onclick_str or "")
     if not match:
-        return {"num_protocolo": None, "reference_year": None}
+        return {"num_protocolo": None, "reference_year": None, "num_versao": None}
     args = re.findall(r"'(.*?)'", match.group(1))
     if len(args) < 4:
-        return {"num_protocolo": None, "reference_year": None}
+        return {"num_protocolo": None, "reference_year": None, "num_versao": None}
     num_protocolo = args[2]
+    num_versao = args[1]
     year_match = PROTOCOLO_YEAR_RE.search(num_protocolo)
     reference_year = year_match.group(1) if year_match else None
-    return {"num_protocolo": num_protocolo, "reference_year": reference_year}
+    return {"num_protocolo": num_protocolo, "reference_year": reference_year, "num_versao": num_versao}
 
 
 def _download_http(page: Page, url: str, path: str) -> None:
@@ -225,6 +226,7 @@ def download_documents(
                 "reference_year": int(reference_date.split("/")[-1]) if reference_date else None,
                 "num_protocolo": metadata["num_protocolo"],
                 "protocol_year": int(metadata["reference_year"]) if metadata["reference_year"] else None,
+                "num_versao": int(metadata["num_versao"]) if metadata["num_versao"] else None,
             }
         )
 

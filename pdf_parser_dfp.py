@@ -163,7 +163,8 @@ def parse_dfp_pdf(
     lines_used: List[str] = []
 
     with pdfplumber.open(path) as pdf:
-        pages_text = [page.extract_text() or "" for page in pdf.pages]
+        pages = list(pdf.pages)
+        pages_text = [page.extract_text() or "" for page in pages]
         full_text = "\n".join(pages_text)
 
     if MILLI_RE.search(full_text):
@@ -180,13 +181,15 @@ def parse_dfp_pdf(
     else:
         selected_scopes = {None}
 
-    for page_text, scope in zip(pages_text, page_scopes):
+    for page_text, scope, page in zip(pages_text, page_scopes, pages):
         if scope not in selected_scopes:
             continue
         section = _detect_section(page_text)
         if not section:
             continue
         years: List[int] = []
+        found_depreciacao = False
+        found_amortizacao = False
         for line in page_text.splitlines():
             if not years:
                 years = _extract_years_from_line(line)
@@ -196,11 +199,19 @@ def parse_dfp_pdf(
             field = _match_field_by_code(code) if code else None
             if field is None:
                 field = _match_field_by_desc(description)
-            if field is None:
-                if section == "dfc" and "deprecia" in description.lower():
-                    field = "depreciacao"
+            if field is None and section == "dfc":
+                lowered = description.lower()
+                if "deprecia" in lowered or "amortiza" in lowered:
+                    if "deprecia" in lowered and "amortiza" in lowered:
+                        field = "depreciacao"
+                    elif "deprecia" in lowered:
+                        field = "depreciacao"
+                    elif "amortiza" in lowered:
+                        field = "amortizacao"
                 else:
                     continue
+            if field is None:
+                continue
             values = _extract_values_from_line(line)
             if not values:
                 logger.debug("Linha relevante sem valores: %s", line)
@@ -214,19 +225,52 @@ def parse_dfp_pdf(
             for year, value in zip(years, values):
                 _store_value(parsed_by_year, year, field, value * multiplier)
                 if field == "depreciacao":
-                    _store_value(parsed_by_year, year, "amortizacao", 0.0)
+                    found_depreciacao = True
+                    if "amortiza" in description.lower():
+                        _store_value(parsed_by_year, year, "amortizacao", 0.0)
+                        logger.info("D&A agregado detectado no PDF (%s): amortizacao=0.0", year)
+                if field == "amortizacao":
+                    found_amortizacao = True
 
         if section == "capital":
+            found_emitidas = False
+            found_tesouraria = False
+            in_integralizado = False
+            in_tesouraria = False
             for line in page_text.splitlines():
-                if "total" in line.lower():
+                lowered = line.lower()
+                if "capital integralizado" in lowered:
+                    in_integralizado = True
+                    in_tesouraria = False
+                    continue
+                if "tesouraria" in lowered:
+                    in_tesouraria = True
+                    in_integralizado = False
+                    continue
+                if "total" in lowered and (in_integralizado or in_tesouraria):
                     values = _extract_values_from_line(line)
                     if not values:
                         continue
                     year = years[0] if years else None
                     if year:
-                        _store_value(parsed_by_year, year, "qtd_acoes_total", values[-1])
+                        multiplier_shares = 1000.0 if "mil" in lowered else 1.0
+                        if in_integralizado:
+                            _store_value(parsed_by_year, year, "qtd_acoes_emitidas", values[-1] * multiplier_shares)
+                            found_emitidas = True
+                        if in_tesouraria:
+                            _store_value(parsed_by_year, year, "qtd_acoes_tesouraria", values[-1] * multiplier_shares)
+                            found_tesouraria = True
                         lines_used.append(line.strip())
-                        break
+            if not found_emitidas:
+                logger.info("qtd_acoes_emitidas ausente no PDF")
+            if not found_tesouraria:
+                logger.info("qtd_acoes_tesouraria ausente no PDF")
+
+        if section == "dfc":
+            if not found_depreciacao:
+                logger.info("depreciacao ausente no PDF")
+            if not found_amortizacao:
+                logger.info("amortizacao ausente no PDF")
 
     dividend_value, dividend_date = _extract_last_dividend(full_text)
     if dividend_value is not None:
