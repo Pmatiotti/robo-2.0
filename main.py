@@ -89,6 +89,33 @@ def consolidate_documents(documents: List[Dict[str, Any]]) -> Dict[int, Dict[str
     return consolidated
 
 
+def build_absolute_payload(
+    normalized_financials: Dict[int, Dict[str, Optional[float]]],
+    ticker: str,
+    year: int,
+) -> Dict[str, Optional[float]]:
+    data = normalized_financials.get(year, {})
+    absolute_fields = {
+        "receita_liquida": data.get("receita_liquida"),
+        "lucro_liquido": data.get("lucro_liquido"),
+        "lucro_bruto": data.get("lucro_bruto"),
+        "caixa": data.get("caixa"),
+        "emprestimos_cp": data.get("emprestimos_cp"),
+        "emprestimos_lp": data.get("emprestimos_lp"),
+        "ebit": data.get("ebit"),
+        "ativo_total": data.get("ativo_total"),
+        "patrimonio_liquido": data.get("patrimonio_liquido"),
+    }
+    filled_keys = [key for key, value in absolute_fields.items() if value is not None]
+    logger.info(
+        "Campos absolutos %s %s preenchidos: %s",
+        ticker,
+        year,
+        filled_keys,
+    )
+    return absolute_fields
+
+
 def collect_pdfs(extracted_paths: List[str], pdf_dir: str) -> List[str]:
     ensure_dir(pdf_dir)
     pdfs: List[str] = []
@@ -346,8 +373,9 @@ def process_row(
         result["raw_extracted"] = raw_data
         result["currency_unit"] = currency_unit
         result["historical"] = historical
+        normalized_financials_by_year = consolidated_raw_by_year
         result["normalized_financials"] = {
-            str(year): data for year, data in consolidated_raw_by_year.items()
+            str(year): data for year, data in normalized_financials_by_year.items()
         }
         result["raw_by_year"] = consolidated_raw_by_year
 
@@ -401,6 +429,11 @@ def process_row(
         payloads = []
         liquidez_media_diaria = parse_decimal(row.get("liquidez_media_diaria"))
         for year, indicators in normalized_indicators_by_year.items():
+            absolute_payload = build_absolute_payload(
+                normalized_financials_by_year,
+                ticker,
+                year,
+            )
             payload = {
                 "ticker": ticker,
                 "asset_class": asset_class,
@@ -414,6 +447,7 @@ def process_row(
                 "dividend_yield": None,
                 "ultimo_dividendo": ultimo_dividendo,
                 "data_ultimo_dividendo": data_ultimo_dividendo,
+                **absolute_payload,
                 **{k: v for k, v in indicators.items()},
             }
             if liquidez_media_diaria is not None:
